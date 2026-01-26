@@ -11,7 +11,7 @@ class YOLOTrainer:
         self.model_type = model_type
         self.data_yaml = data_yaml
         self.output_dir = output_dir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # self.output_dir.mkdir(parents=True, exist_ok=True)
         self.model = YOLO(f"resources/{model_type}")
 
     def train(self, **train_kwargs):
@@ -47,7 +47,7 @@ class YOLOEvaluator:
         self.weights_path = weights_path
         self.data_yaml = data_yaml
         self.output_dir = output_dir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # self.output_dir.mkdir(parents=True, exist_ok=True)
         self.model = YOLO(weights_path)
 
     def test(self, **test_kwargs):
