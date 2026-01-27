@@ -1,10 +1,13 @@
 import random
 import shutil
 import yaml
+import numpy as np
 
 from pathlib import Path
 from enum import Enum
 from typing import Dict
+
+from ultralytics import YOLO
 
 from src.utils import DetectionAP50
 from src.dataset_layout import DatasetLayout
@@ -193,6 +196,15 @@ class ObjectDetectionExperiment:
         _ = trainer1.train(**train_kwargs, project=work_dir, name="stage1")
         weak_weights = work_dir / "stage1/weights/best.pt"
 
+        # additional validation to extract optimal working point (maximazing F1-score)
+        model = YOLO(weak_weights)
+        results = model.val(data=str(labeled_yaml), save_json=True, plots=True, project=work_dir, name="stage1_conf_score_thresh")
+        f1_curve = results.box.f1_curve.flatten()
+        best_idx = f1_curve.argmax()
+        conf_thresholds = np.linspace(0, 1, len(f1_curve))
+        best_conf = conf_thresholds[best_idx]
+        self.logger.info(f"best_conf={best_conf}")
+
         # ----------------------------------------------------
         # (4) Pseudo labeling pool of unlabeled samples
         # ----------------------------------------------------
@@ -200,13 +212,13 @@ class ObjectDetectionExperiment:
 
         weak_yolo = WeakYoloSingleton(
             model_path=str(weak_weights),
-            conf_thresh=pseudo_kwargs.get("conf", 0.5),
+            conf_thresh=best_conf,
         )
 
         labeler = YOLOWeakAutoLabeler(
             yolo=weak_yolo,
             class_id=0,
-            conf_thresh=pseudo_kwargs.get("conf", 0.5),
+            conf_thresh=best_conf,
         )
 
         pseudo_lbl_dir = work_dir / "pseudo/labels"
@@ -283,18 +295,19 @@ class ObjectDetectionExperiment:
 
 if __name__ == "__main__":
 
-    output_root = Path("runs/medical-pills")
-    data_yaml = "data/datasets/medical-pills/medical-pills.yaml"
+    dataset_name = "crack-seg"
+    output_root = Path(f"runs/{dataset_name}")
+    data_yaml = f"data/datasets/{dataset_name}/{dataset_name}.yaml"
 
     exp = ObjectDetectionExperiment(
-        dataset_root=Path("data/datasets/medical-pills"),
+        dataset_root=Path(f"data/datasets/{dataset_name}"),
         data_yaml=data_yaml,
         model_type="yolo11n.pt",
         output_root=output_root
     )
 
     train_kwargs = dict(
-        epochs=50,
+        epochs=100,
         imgsz=640,
         batch=16,
     )
@@ -307,18 +320,20 @@ if __name__ == "__main__":
         conf=0.6,
     )
 
+    """
     # STANDARD
     results = exp.run(
         mode=ExperimentMode.STANDARD,
         train_kwargs=train_kwargs,
         test_kwargs=test_kwargs
     )
+    """
 
     # WEAK_YOLO_PSEUDO
     results = exp.run(
         mode=ExperimentMode.WEAK_YOLO_PSEUDO,
-        n_labeled=16,
-        n_val=16,
+        n_labeled=100,
+        n_val=100,
         train_kwargs=train_kwargs,
         test_kwargs=test_kwargs,
         pseudo_kwargs=pseudo_kwargs
