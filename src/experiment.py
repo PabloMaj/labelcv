@@ -9,12 +9,15 @@ from typing import Dict
 
 from ultralytics import YOLO
 
-from src.utils import DetectionAP50
+from src.utils import DetectionAP50, load_images_and_labels
 from src.dataset_layout import DatasetLayout
 from src.experiment_logger import ExperimentLogger
 from src.yolo_subset_sampler import YoloSubsetSampler
 from src.yolo_train_eval import YOLOTrainer, YOLOEvaluator
 from src.yolo_weak_auto_labeler import WeakYoloSingleton, YOLOWeakAutoLabeler
+from src.prompt_optimizer import SAM3PromptOptimizer
+from src.sam_model import SamSingleton
+from src.sam_auto_labeler import SAM3AutoLabeler
 
 
 class ExperimentMode(Enum):
@@ -289,8 +292,183 @@ class ObjectDetectionExperiment:
         test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
         return test_results.results_dict
 
-    def _run_sam3_pseudo(self):
-        pass
+    def _run_sam3_pseudo(
+        self,
+        n_labeled: int,
+        n_val: int,
+        train_kwargs: Dict,
+        test_kwargs: Dict,
+        pseudo_kwargs: Dict,
+    ):
+        self.logger.info("SAM LABELING")
+
+        work_dir = self.output_root / "sam"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        # ----------------------------------------------------
+        # (1) Prepare sets of labeled and unlabeled samples for training
+        # ----------------------------------------------------
+        self.logger.info("(1) Prepare sets of labeled and unlabeled samples for training")
+
+        train_imgs = sorted(self.dataset.images("train").glob("*.*"))
+        assert n_labeled < len(train_imgs)
+
+        labeled_imgs = set(random.sample(train_imgs, n_labeled))
+        unlabeled_imgs = set(train_imgs) - labeled_imgs
+
+        labeled_img_dir = work_dir / "labeled/images"
+        labeled_lbl_dir = work_dir / "labeled/labels"
+        unlabeled_img_dir = work_dir / "unlabeled/images"
+
+        labeled_img_dir.mkdir(parents=True, exist_ok=True)
+        labeled_lbl_dir.mkdir(parents=True, exist_ok=True)
+        unlabeled_img_dir.mkdir(parents=True, exist_ok=True)
+
+        for img in labeled_imgs:
+            shutil.copy(img, labeled_img_dir / img.name)
+            shutil.copy(
+                self.dataset.labels("train") / f"{img.stem}.txt",
+                labeled_lbl_dir / f"{img.stem}.txt",
+            )
+
+        for img in unlabeled_imgs:
+            shutil.copy(img, unlabeled_img_dir / img.name)
+
+        # ----------------------------------------------------
+        # (2) Prepare set of labeled samples for validation
+        # ----------------------------------------------------
+        self.logger.info("(2) Prepare set of labeled samples for validation")
+
+        val_imgs = sorted(self.dataset.images("val").glob("*.*"))
+        val_sample = set(random.sample(val_imgs, n_val))
+
+        val_img_dir = work_dir / "val/images"
+        val_lbl_dir = work_dir / "val/labels"
+        val_img_dir.mkdir(parents=True, exist_ok=True)
+        val_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+        for img in val_sample:
+            shutil.copy(img, val_img_dir / img.name)
+            shutil.copy(
+                self.dataset.labels("val") / f"{img.stem}.txt",
+                val_lbl_dir / f"{img.stem}.txt",
+            )
+
+        # ----------------------------------------------------
+        # (3) Determine best description for marked objects
+        # ----------------------------------------------------
+        train_images, train_labels = load_images_and_labels(labeled_img_dir, labeled_lbl_dir)
+        val_images, val_labels = load_images_and_labels(val_img_dir, val_lbl_dir)
+
+        metric = DetectionAP50()
+
+        optimizer = SAM3PromptOptimizer(
+            sam_model_path="resources/sam3.pt",
+            llm_model="gemma3:latest",
+            metric=metric,
+            max_iters=2,
+        )
+
+        prompt_optimizer_dir = work_dir / "prompt_optimizer"
+        prompt_optimizer_dir.mkdir(parents=True, exist_ok=True)
+
+        best = optimizer.optimize(
+            train_images=train_images,
+            train_yolo_labels=train_labels,
+            val_images=val_images,
+            val_yolo_labels=val_labels,
+            workdir=prompt_optimizer_dir
+        )
+
+        self.logger.info(f"BEST PROMPT:\n{best['desc']}\nAP50: {best['iou']:.4f}")
+        best_prompt_file = work_dir / "best_prompt.txt"
+        with open(best_prompt_file, "w", encoding="utf-8") as f:
+            f.write(f"BEST PROMPT:\n{best['desc']}\nAP50: {best['iou']:.4f}")
+
+        prompt_filter = best['desc']
+        print(f"prompt_filter={prompt_filter}")
+
+        # ----------------------------------------------------
+        # (4) Pseudo labeling pool of unlabeled samples with SAM
+        # ----------------------------------------------------
+        self.logger.info("(4) Pseudo labeling pool of unlabeled samples with SAM")
+
+        model_sam = SamSingleton(
+            model_path="resources/sam3.pt",
+            conf_thresh=0.25
+        )
+        labeler = SAM3AutoLabeler(model_sam, class_id=0)
+
+        pseudo_lbl_dir = work_dir / "pseudo/labels"
+        pseudo_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+        labeler.label_folder(
+            image_dir=unlabeled_img_dir,
+            out_label_dir=pseudo_lbl_dir,
+            prompt_filter=prompt_filter,
+            visualize=False
+        )
+
+        # ----------------------------------------------------
+        # (5) Mixed train with samples with labels and pseudo-labels
+        # ----------------------------------------------------
+        self.logger.info("(5) Mixed train with samples with labels and pseudo-labels")
+
+        mixed_img_dir = work_dir / "mixed/images"
+        mixed_lbl_dir = work_dir / "mixed/labels"
+        mixed_img_dir.mkdir(parents=True, exist_ok=True)
+        mixed_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+        for img in labeled_img_dir.glob("*"):
+            shutil.copy(img, mixed_img_dir / img.name)
+            shutil.copy(
+                labeled_lbl_dir / f"{img.stem}.txt",
+                mixed_lbl_dir / f"{img.stem}.txt",
+            )
+
+        for img in unlabeled_img_dir.glob("*"):
+            lbl = pseudo_lbl_dir / f"{img.stem}.txt"
+            if lbl.exists():
+                shutil.copy(img, mixed_img_dir / img.name)
+                shutil.copy(lbl, mixed_lbl_dir / lbl.name)
+
+        mixed_path = mixed_img_dir.relative_to(work_dir)
+        val_path = val_img_dir.relative_to(work_dir)
+
+        mixed_yaml = work_dir / "mixed.yaml"
+        mixed_yaml.write_text(
+            f"""
+            train: {mixed_path.as_posix()}
+            val: {val_path.as_posix()}
+
+            nc: {self.nc}
+            names: {self.class_names}
+            """
+        )
+
+        trainer = YOLOTrainer(
+            model_type=self.model_type,
+            data_yaml=str(mixed_yaml),
+            output_dir=work_dir / "yolo_train"
+        )
+
+        _ = trainer.train(**train_kwargs, project=work_dir, name="yolo_train")
+        final_weights = work_dir / "yolo_train/weights/best.pt"
+
+        # ----------------------------------------------------
+        # (6) Final evaluation using test set
+        # ----------------------------------------------------
+        self.logger.info("(6) Final evaluation using test set")
+
+        evaluator = YOLOEvaluator(
+            weights_path=str(final_weights),
+            data_yaml=str(self.data_yaml),
+            output_dir=work_dir / "eval_test",
+        )
+
+        test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
+
+        return test_results.results_dict
 
 
 if __name__ == "__main__":
@@ -329,11 +507,23 @@ if __name__ == "__main__":
     )
     """
 
+    """
     # WEAK_YOLO_PSEUDO
     results = exp.run(
         mode=ExperimentMode.WEAK_YOLO_PSEUDO,
         n_labeled=100,
         n_val=100,
+        train_kwargs=train_kwargs,
+        test_kwargs=test_kwargs,
+        pseudo_kwargs=pseudo_kwargs
+    )
+    """
+
+    # SAM
+    results = exp.run(
+        mode=ExperimentMode.SAM3_PSEUDO,
+        n_labeled=10,
+        n_val=10,
         train_kwargs=train_kwargs,
         test_kwargs=test_kwargs,
         pseudo_kwargs=pseudo_kwargs

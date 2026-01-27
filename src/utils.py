@@ -49,17 +49,40 @@ def mask_to_bbox(mask: np.ndarray) -> Tuple[int, int, int, int] | None:
 
 
 def load_yolo_bboxes(label_path, img_shape):
+    """
+    Supports:
+    - YOLO detection: class cx cy w h
+    - YOLO instance segmentation: class x1 y1 x2 y2 ... xn yn
+    Returns list of (x1, y1, x2, y2)
+    """
     h, w = img_shape
     boxes = []
 
     with open(label_path) as f:
         for line in f:
-            _, cx, cy, bw, bh = map(float, line.split())
-            x1 = int((cx - bw / 2) * w)
-            y1 = int((cy - bh / 2) * h)
-            x2 = int((cx + bw / 2) * w)
-            y2 = int((cy + bh / 2) * h)
-            boxes.append((x1, y1, x2, y2))
+            parts = list(map(float, line.split()))
+            coords = parts[1:]
+
+            # --- klasyczny YOLO bbox ---
+            if len(coords) == 4:
+                cx, cy, bw, bh = coords
+                x1 = int((cx - bw / 2) * w)
+                y1 = int((cy - bh / 2) * h)
+                x2 = int((cx + bw / 2) * w)
+                y2 = int((cy + bh / 2) * h)
+                boxes.append((x1, y1, x2, y2))
+
+            # --- segmentacja instancyjna → bbox z punktów ---
+            elif len(coords) >= 6 and len(coords) % 2 == 0:
+                xs = []
+                ys = []
+                for i in range(0, len(coords), 2):
+                    xs.append(int(coords[i] * w))
+                    ys.append(int(coords[i + 1] * h))
+
+                x1, y1 = min(xs), min(ys)
+                x2, y2 = max(xs), max(ys)
+                boxes.append((x1, y1, x2, y2))
 
     return boxes
 
