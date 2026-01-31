@@ -2,6 +2,8 @@ import random
 import shutil
 import yaml
 import numpy as np
+from datetime import datetime
+import traceback
 
 from pathlib import Path
 from enum import Enum
@@ -12,7 +14,6 @@ from ultralytics import YOLO
 from src.utils import DetectionAP50, load_images_and_labels
 from src.dataset_layout import DatasetLayout
 from src.experiment_logger import ExperimentLogger
-from src.yolo_subset_sampler import YoloSubsetSampler
 from src.yolo_train_eval import YOLOTrainer, YOLOEvaluator
 from src.yolo_weak_auto_labeler import WeakYoloSingleton, YOLOWeakAutoLabeler
 from src.prompt_optimizer import SAM3PromptOptimizer
@@ -39,6 +40,8 @@ class ObjectDetectionExperiment:
         self.data_yaml = data_yaml
         self.output_root = output_root
         self.model_type = model_type
+        self.random_state = random_state
+        self.rng = random.Random(random_state)
 
         # ----------------------------------
         # READ nc + class names FROM YAML
@@ -57,27 +60,80 @@ class ObjectDetectionExperiment:
         print(f"self.nc={self.nc}")
 
         self.logger = ExperimentLogger(output_root)
-        self.sampler = YoloSubsetSampler(random_state)
         self.metric = DetectionAP50()
 
-    def run(self, mode: ExperimentMode, **kwargs):
-        self.logger.info(f"Running mode: {mode.value}")
+    def _save_metadata(self, work_dir: Path, metadata: dict):
+        metadata = dict(metadata)
+        metadata["timestamp"] = datetime.now().isoformat()
+        metadata["random_state"] = self.random_state
 
-        if mode == ExperimentMode.STANDARD:
-            return self._run_standard(**kwargs)
+        meta_path = work_dir / "metadata.yaml"
+        with open(meta_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(metadata, f, sort_keys=False)
 
-        if mode == ExperimentMode.WEAK_YOLO_PSEUDO:
-            return self._run_weak_yolo_pseudo(**kwargs)
+    def safe_sample(self, population, k, work_dir: Path, description: str):
+        try:
+            return set(self.rng.sample(population, k))
+        except ValueError as e:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            error_file = work_dir / "error.log"
+            with open(error_file, "a", encoding="utf-8") as f:
+                f.write(f"\nERROR during sampling {description}:\n")
+                f.write(str(e) + "\n\n")
+                f.write("Full traceback:\n")
+                f.write(traceback.format_exc())
+            self.logger.error(f"Sampling error ({description}). See {error_file}")
+            return None
 
-        if mode == ExperimentMode.SAM3_PSEUDO:
-            return self._run_sam3_pseudo(**kwargs)
+    def run(self, mode: ExperimentMode, repeats: int = 1, **kwargs):
+        self.logger.info(f"Running mode: {mode.value}, repeats={repeats}")
 
-        raise ValueError(f"Unsupported mode: {mode}")
+        all_results = []
 
-    def _run_standard(self, train_kwargs: dict, test_kwargs: dict):
+        for i in range(repeats):
+            seed = self.random_state + i
+            self.rng.seed(seed)
+
+            self.logger.info(f"=== REPEAT {i + 1}/{repeats} (seed={seed}) ===")
+
+            if mode == ExperimentMode.STANDARD:
+                result, work_dir = self._run_standard(repeat_idx=i, **kwargs)
+
+            elif mode == ExperimentMode.WEAK_YOLO_PSEUDO:
+                result, work_dir = self._run_weak_yolo_pseudo(
+                    repeat_idx=i, **kwargs
+                )
+
+            elif mode == ExperimentMode.SAM3_PSEUDO:
+                result, work_dir = self._run_sam3_pseudo(
+                    repeat_idx=i, **kwargs
+                )
+
+            else:
+                raise ValueError(f"Unsupported mode: {mode}")
+
+            metadata = dict(
+                mode=mode.value,
+                repeat_idx=i,
+                seed=seed,
+                model_type=self.model_type,
+                n_labeled=kwargs.get("n_labeled"),
+                n_val=kwargs.get("n_val"),
+                train_kwargs=kwargs.get("train_kwargs"),
+                test_kwargs=kwargs.get("test_kwargs"),
+                results=result
+            )
+
+            self._save_metadata(work_dir, metadata)
+            all_results.append(result)
+
+        return all_results
+
+    def _run_standard(self, train_kwargs: dict, test_kwargs: dict, repeat_idx: int = 0):
         self.logger.info("STANDARD: training on full dataset")
 
-        work_dir = self.output_root / "standard_yolo"
+        work_dir = self.output_root / "standard_yolo" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
+
         work_dir.mkdir(parents=True, exist_ok=True)
 
         # ----------------------------------------------------
@@ -107,7 +163,7 @@ class ObjectDetectionExperiment:
 
         test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
 
-        return test_results.results_dict
+        return test_results.results_dict, work_dir
 
     def _run_weak_yolo_pseudo(
         self,
@@ -115,11 +171,11 @@ class ObjectDetectionExperiment:
         n_val: int,
         train_kwargs: Dict,
         test_kwargs: Dict,
-        pseudo_kwargs: Dict,
+        repeat_idx: int = 0
     ):
         self.logger.info("WEAK YOLO PSEUDO-LABELING")
 
-        work_dir = self.output_root / "weak_yolo"
+        work_dir = self.output_root / "weak_yolo" / f"n_labeled_{n_labeled}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
         work_dir.mkdir(parents=True, exist_ok=True)
 
         # ----------------------------------------------------
@@ -130,7 +186,9 @@ class ObjectDetectionExperiment:
         train_imgs = sorted(self.dataset.images("train").glob("*.*"))
         assert n_labeled < len(train_imgs)
 
-        labeled_imgs = set(random.sample(train_imgs, n_labeled))
+        labeled_imgs = self.safe_sample(train_imgs, n_labeled, work_dir, "train images")
+        if labeled_imgs is None:
+            return {}, work_dir
         unlabeled_imgs = set(train_imgs) - labeled_imgs
 
         labeled_img_dir = work_dir / "labeled/images"
@@ -157,7 +215,9 @@ class ObjectDetectionExperiment:
         self.logger.info("(2) Prepare set of labeled samples for validation")
 
         val_imgs = sorted(self.dataset.images("val").glob("*.*"))
-        val_sample = set(random.sample(val_imgs, n_val))
+        val_sample = self.safe_sample(val_imgs, n_val, work_dir, "validation images")
+        if val_sample is None:
+            return {}, work_dir
 
         val_img_dir = work_dir / "val/images"
         val_lbl_dir = work_dir / "val/labels"
@@ -290,7 +350,7 @@ class ObjectDetectionExperiment:
         )
 
         test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
-        return test_results.results_dict
+        return test_results.results_dict, work_dir
 
     def _run_sam3_pseudo(
         self,
@@ -298,11 +358,11 @@ class ObjectDetectionExperiment:
         n_val: int,
         train_kwargs: Dict,
         test_kwargs: Dict,
-        pseudo_kwargs: Dict,
+        repeat_idx: int = 0
     ):
         self.logger.info("SAM LABELING")
 
-        work_dir = self.output_root / "sam"
+        work_dir = self.output_root / "sam" / f"n_labeled_{n_labeled}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
         work_dir.mkdir(parents=True, exist_ok=True)
 
         # ----------------------------------------------------
@@ -313,7 +373,9 @@ class ObjectDetectionExperiment:
         train_imgs = sorted(self.dataset.images("train").glob("*.*"))
         assert n_labeled < len(train_imgs)
 
-        labeled_imgs = set(random.sample(train_imgs, n_labeled))
+        labeled_imgs = self.safe_sample(train_imgs, n_labeled, work_dir, "train images")
+        if labeled_imgs is None:
+            return {}, work_dir
         unlabeled_imgs = set(train_imgs) - labeled_imgs
 
         labeled_img_dir = work_dir / "labeled/images"
@@ -340,7 +402,9 @@ class ObjectDetectionExperiment:
         self.logger.info("(2) Prepare set of labeled samples for validation")
 
         val_imgs = sorted(self.dataset.images("val").glob("*.*"))
-        val_sample = set(random.sample(val_imgs, n_val))
+        val_sample = self.safe_sample(val_imgs, n_val, work_dir, "validation images")
+        if val_sample is None:
+            return {}, work_dir
 
         val_img_dir = work_dir / "val/images"
         val_lbl_dir = work_dir / "val/labels"
@@ -366,7 +430,7 @@ class ObjectDetectionExperiment:
             sam_model_path="resources/sam3.pt",
             llm_model="gemma3:latest",
             metric=metric,
-            max_iters=2,
+            max_iters=10,
         )
 
         prompt_optimizer_dir = work_dir / "prompt_optimizer"
@@ -468,12 +532,14 @@ class ObjectDetectionExperiment:
 
         test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
 
-        return test_results.results_dict
+        return test_results.results_dict, work_dir
 
 
 if __name__ == "__main__":
 
-    dataset_name = "crack-seg"
+    REPEATS = 2
+
+    dataset_name = "medical-pills"
     output_root = Path(f"runs/{dataset_name}")
     data_yaml = f"data/datasets/{dataset_name}/{dataset_name}.yaml"
 
@@ -481,7 +547,8 @@ if __name__ == "__main__":
         dataset_root=Path(f"data/datasets/{dataset_name}"),
         data_yaml=data_yaml,
         model_type="yolo11n.pt",
-        output_root=output_root
+        output_root=output_root,
+        random_state=42
     )
 
     train_kwargs = dict(
@@ -494,37 +561,39 @@ if __name__ == "__main__":
         imgsz=640,
     )
 
-    pseudo_kwargs = dict(
-        conf=0.6,
-    )
-
     """
     # STANDARD
     results = exp.run(
         mode=ExperimentMode.STANDARD,
         train_kwargs=train_kwargs,
-        test_kwargs=test_kwargs
+        test_kwargs=test_kwargs,
+        repeats=REPEATS
     )
     """
 
     """
-    # WEAK_YOLO_PSEUDO
-    results = exp.run(
-        mode=ExperimentMode.WEAK_YOLO_PSEUDO,
-        n_labeled=100,
-        n_val=100,
-        train_kwargs=train_kwargs,
-        test_kwargs=test_kwargs,
-        pseudo_kwargs=pseudo_kwargs
-    )
+    # PSEUDO WEAK YOLO
+    weak_n_labeled_values = [10, 25]
+    for n_labeled in weak_n_labeled_values:
+        print(f"\n=== WEAK YOLO | n_labeled={n_labeled} | repeats={REPEATS} ===")
+        results = exp.run(
+            mode=ExperimentMode.WEAK_YOLO_PSEUDO,
+            n_labeled=n_labeled,
+            n_val=n_labeled,
+            train_kwargs=train_kwargs,
+            test_kwargs=test_kwargs,
+            repeats=REPEATS
+        )
     """
 
-    # SAM
-    results = exp.run(
-        mode=ExperimentMode.SAM3_PSEUDO,
-        n_labeled=10,
-        n_val=10,
-        train_kwargs=train_kwargs,
-        test_kwargs=test_kwargs,
-        pseudo_kwargs=pseudo_kwargs
-    )
+    # PSEUDO SAM
+    sam_n_labeled_values = [3, 5]
+    for n_labeled in sam_n_labeled_values:
+        results = exp.run(
+            mode=ExperimentMode.SAM3_PSEUDO,
+            n_labeled=n_labeled,
+            n_val=n_labeled,
+            train_kwargs=train_kwargs,
+            test_kwargs=test_kwargs,
+            repeats=REPEATS,
+        )
