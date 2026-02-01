@@ -3,7 +3,7 @@ from typing import List
 
 class PromptGenerator:
     INITIAL_PROMPT = (
-        "Generate a short description (max 10 words) of the marked objects "
+        "Generate a short description (max {max_words} words) of the marked objects "
         "with red rectangles, including colour, shape, and visual appearance. "
         "Use the following images: [IMAGES]. "
         "Generate ONE concise summary description. "
@@ -11,7 +11,7 @@ class PromptGenerator:
     )
 
     ITER_PROMPT = (
-        "Generate a short description (max 10 words) of the marked objects "
+        "Generate a short description (max {max_words} words) of the marked objects "
         "with red rectangles, including colour, shape, and visual appearance. "
         "Use the following images: [IMAGES]. "
         "Generate ONE concise summary description. "
@@ -28,13 +28,15 @@ class PromptGenerator:
     )
 
     @staticmethod
-    def build_initial(images: List[str]) -> str:
-        return PromptGenerator.INITIAL_PROMPT.replace(
-            "[IMAGES]", ", ".join(images)
+    def build_initial(images: List[str], max_words: int) -> str:
+        return (
+            PromptGenerator.INITIAL_PROMPT
+            .format(max_words=max_words)
+            .replace("[IMAGES]", ", ".join(images))
         )
 
     @staticmethod
-    def build_iterative(images: List[str], history: List[dict]) -> str:
+    def build_iterative(images: List[str], history: List[dict], max_words: int) -> str:
 
         hist_str = "\n".join(
             f"[{i + 1}] {h['desc']} → AP50={h['iou']:.4f}"
@@ -44,7 +46,8 @@ class PromptGenerator:
         return (
             PromptGenerator.ITER_PROMPT
             .format(
-                history=hist_str
+                max_words=max_words,
+                history=hist_str,
             )
             .replace("[IMAGES]", ", ".join(images))
         )

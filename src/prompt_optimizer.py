@@ -17,11 +17,13 @@ class SAM3PromptOptimizer:
         llm_model: str,
         metric: DetectionAP50,
         max_iters: int = 5,
+        max_desc_words: int = 10
     ):
         self.sam = SamSingleton(model_path=sam_model_path)
         self.llm = OllamaVisionLLM(llm_model)
         self.metric = metric
         self.max_iters = max_iters
+        self.max_desc_words = max_desc_words
         self.history_all = []
         self.history_topk = []
         self.top_k = 3
@@ -62,9 +64,9 @@ class SAM3PromptOptimizer:
         # ==========================
         for it in range(self.max_iters):
             if it == 0:
-                prompt = PromptGenerator.build_initial(boxed_str)
+                prompt = PromptGenerator.build_initial(boxed_str, max_words=self.max_desc_words)
             else:
-                prompt = PromptGenerator.build_iterative(boxed_str, self.history_topk)
+                prompt = PromptGenerator.build_iterative(boxed_str, self.history_topk, max_words=self.max_desc_words)
             desc = self.llm.inference(prompt, boxed_str)
             previous_descs = {h["desc"] for h in self.history_topk}
             if desc in previous_descs:

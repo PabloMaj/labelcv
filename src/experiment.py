@@ -358,6 +358,9 @@ class ObjectDetectionExperiment:
         n_val: int,
         train_kwargs: Dict,
         test_kwargs: Dict,
+        llm_model: str,
+        max_iters_prompt_optimizer: int,
+        max_desc_words: int,
         repeat_idx: int = 0
     ):
         self.logger.info("SAM LABELING")
@@ -428,9 +431,10 @@ class ObjectDetectionExperiment:
 
         optimizer = SAM3PromptOptimizer(
             sam_model_path="resources/sam3.pt",
-            llm_model="gemma3:latest",
+            llm_model=llm_model,
             metric=metric,
-            max_iters=10,
+            max_iters=max_iters_prompt_optimizer,
+            max_desc_words=max_desc_words
         )
 
         prompt_optimizer_dir = work_dir / "prompt_optimizer"
@@ -596,4 +600,7 @@ if __name__ == "__main__":
             train_kwargs=train_kwargs,
             test_kwargs=test_kwargs,
             repeats=REPEATS,
+            llm_model="gemma3:latest",
+            max_iters_prompt_optimizer=50,
+            max_desc_words=2
         )
