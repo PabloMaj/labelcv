@@ -5,7 +5,7 @@ class SamSingleton:
     _instance = None
     _model = None
 
-    def __new__(cls, model_path: str = None, conf_thresh: float = None, save_flag: bool = False):
+    def __new__(cls, model_path: str = None, conf_thresh: float = 0.25, save_flag: bool = False):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             if model_path is None:

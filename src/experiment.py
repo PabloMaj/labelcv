@@ -3,7 +3,6 @@ import shutil
 import yaml
 import numpy as np
 from datetime import datetime
-import traceback
 
 from pathlib import Path
 from enum import Enum
@@ -12,6 +11,8 @@ from typing import Dict
 from ultralytics import YOLO
 
 from src.utils import DetectionAP50, load_images_and_labels
+from src.dataset_preparation import prepare_labeled_unlabeled_with_object_budget
+
 from src.dataset_layout import DatasetLayout
 from src.experiment_logger import ExperimentLogger
 from src.yolo_train_eval import YOLOTrainer, YOLOEvaluator
@@ -71,20 +72,6 @@ class ObjectDetectionExperiment:
         with open(meta_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(metadata, f, sort_keys=False)
 
-    def safe_sample(self, population, k, work_dir: Path, description: str):
-        try:
-            return set(self.rng.sample(population, k))
-        except ValueError as e:
-            work_dir.mkdir(parents=True, exist_ok=True)
-            error_file = work_dir / "error.log"
-            with open(error_file, "a", encoding="utf-8") as f:
-                f.write(f"\nERROR during sampling {description}:\n")
-                f.write(str(e) + "\n\n")
-                f.write("Full traceback:\n")
-                f.write(traceback.format_exc())
-            self.logger.error(f"Sampling error ({description}). See {error_file}")
-            return None
-
     def run(self, mode: ExperimentMode, repeats: int = 1, **kwargs):
         self.logger.info(f"Running mode: {mode.value}, repeats={repeats}")
 
@@ -98,17 +85,10 @@ class ObjectDetectionExperiment:
 
             if mode == ExperimentMode.STANDARD:
                 result, work_dir = self._run_standard(repeat_idx=i, **kwargs)
-
             elif mode == ExperimentMode.WEAK_YOLO_PSEUDO:
-                result, work_dir = self._run_weak_yolo_pseudo(
-                    repeat_idx=i, **kwargs
-                )
-
+                result, work_dir = self._run_weak_yolo_pseudo(repeat_idx=i, **kwargs)
             elif mode == ExperimentMode.SAM3_PSEUDO:
-                result, work_dir = self._run_sam3_pseudo(
-                    repeat_idx=i, **kwargs
-                )
-
+                result, work_dir = self._run_sam3_pseudo(repeat_idx=i, **kwargs)
             else:
                 raise ValueError(f"Unsupported mode: {mode}")
 
@@ -117,8 +97,11 @@ class ObjectDetectionExperiment:
                 repeat_idx=i,
                 seed=seed,
                 model_type=self.model_type,
-                n_labeled=kwargs.get("n_labeled"),
-                n_val=kwargs.get("n_val"),
+                n_labeled=kwargs.get("target_objects_train"),
+                n_val=kwargs.get("target_objects_val"),
+                llm_model=kwargs.get("llm_model"),
+                max_iters_prompt_optimizer=kwargs.get("max_iters_prompt_optimizer"),
+                max_desc_words=kwargs.get("max_desc_words"),
                 train_kwargs=kwargs.get("train_kwargs"),
                 test_kwargs=kwargs.get("test_kwargs"),
                 results=result
@@ -167,15 +150,15 @@ class ObjectDetectionExperiment:
 
     def _run_weak_yolo_pseudo(
         self,
-        n_labeled: int,
-        n_val: int,
+        target_objects_train: int,
+        target_objects_val: int,
         train_kwargs: Dict,
         test_kwargs: Dict,
         repeat_idx: int = 0
     ):
         self.logger.info("WEAK YOLO PSEUDO-LABELING")
 
-        work_dir = self.output_root / "weak_yolo" / f"n_labeled_{n_labeled}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
+        work_dir = self.output_root / "weak_yolo" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
         work_dir.mkdir(parents=True, exist_ok=True)
 
         # ----------------------------------------------------
@@ -183,61 +166,52 @@ class ObjectDetectionExperiment:
         # ----------------------------------------------------
         self.logger.info("(1) Prepare sets of labeled and unlabeled samples for training")
 
+        labeled_img_dir_train = work_dir / "labeled/images"
+        labeled_lbl_dir_train = work_dir / "labeled/labels"
+        unlabeled_img_dir_train = work_dir / "unlabeled/images"
+
         train_imgs = sorted(self.dataset.images("train").glob("*.*"))
-        assert n_labeled < len(train_imgs)
 
-        labeled_imgs = self.safe_sample(train_imgs, n_labeled, work_dir, "train images")
-        if labeled_imgs is None:
-            return {}, work_dir
-        unlabeled_imgs = set(train_imgs) - labeled_imgs
-
-        labeled_img_dir = work_dir / "labeled/images"
-        labeled_lbl_dir = work_dir / "labeled/labels"
-        unlabeled_img_dir = work_dir / "unlabeled/images"
-
-        labeled_img_dir.mkdir(parents=True, exist_ok=True)
-        labeled_lbl_dir.mkdir(parents=True, exist_ok=True)
-        unlabeled_img_dir.mkdir(parents=True, exist_ok=True)
-
-        for img in labeled_imgs:
-            shutil.copy(img, labeled_img_dir / img.name)
-            shutil.copy(
-                self.dataset.labels("train") / f"{img.stem}.txt",
-                labeled_lbl_dir / f"{img.stem}.txt",
-            )
-
-        for img in unlabeled_imgs:
-            shutil.copy(img, unlabeled_img_dir / img.name)
+        stats_train = prepare_labeled_unlabeled_with_object_budget(
+            images=train_imgs,
+            labels_dir=self.dataset.labels("train"),
+            labeled_img_dir=labeled_img_dir_train,
+            labeled_lbl_dir=labeled_lbl_dir_train,
+            unlabeled_img_dir=unlabeled_img_dir_train,
+            target_objects=target_objects_train,
+            rng=self.rng
+        )
+        print(stats_train)
 
         # ----------------------------------------------------
         # (2) Prepare set of labeled samples for validation
         # ----------------------------------------------------
         self.logger.info("(2) Prepare set of labeled samples for validation")
 
+        labeled_img_dir_val = work_dir / "val/images"
+        labeled_lbl_dir_val = work_dir / "val/labels"
+        unlabeled_img_val = work_dir / "_tmp_ignore"
+
         val_imgs = sorted(self.dataset.images("val").glob("*.*"))
-        val_sample = self.safe_sample(val_imgs, n_val, work_dir, "validation images")
-        if val_sample is None:
-            return {}, work_dir
 
-        val_img_dir = work_dir / "val/images"
-        val_lbl_dir = work_dir / "val/labels"
-        val_img_dir.mkdir(parents=True, exist_ok=True)
-        val_lbl_dir.mkdir(parents=True, exist_ok=True)
-
-        for img in val_sample:
-            shutil.copy(img, val_img_dir / img.name)
-            shutil.copy(
-                self.dataset.labels("val") / f"{img.stem}.txt",
-                val_lbl_dir / f"{img.stem}.txt",
-            )
+        stats_val = prepare_labeled_unlabeled_with_object_budget(
+            images=val_imgs,
+            labels_dir=self.dataset.labels("val"),
+            labeled_img_dir=labeled_img_dir_val,
+            labeled_lbl_dir=labeled_lbl_dir_val,
+            unlabeled_img_dir=unlabeled_img_val,
+            target_objects=target_objects_val,
+            rng=self.rng
+        )
+        print(stats_val)
 
         # ----------------------------------------------------
         # (3) First train with small set of labeled samples
         # ----------------------------------------------------
         self.logger.info("(3) First train with small set of labeled samples")
 
-        train_path = labeled_img_dir.relative_to(work_dir)
-        val_path = val_img_dir.relative_to(work_dir)
+        train_path = labeled_img_dir_train.relative_to(work_dir)
+        val_path = labeled_img_dir_val.relative_to(work_dir)
 
         labeled_yaml = work_dir / "labeled.yaml"
         labeled_yaml.write_text(
@@ -288,7 +262,7 @@ class ObjectDetectionExperiment:
         pseudo_lbl_dir.mkdir(parents=True, exist_ok=True)
 
         labeler.label_folder(
-            image_dir=unlabeled_img_dir,
+            image_dir=unlabeled_img_dir_train,
             out_label_dir=pseudo_lbl_dir,
         )
 
@@ -302,21 +276,21 @@ class ObjectDetectionExperiment:
         mixed_img_dir.mkdir(parents=True, exist_ok=True)
         mixed_lbl_dir.mkdir(parents=True, exist_ok=True)
 
-        for img in labeled_img_dir.glob("*"):
+        for img in labeled_img_dir_train.glob("*"):
             shutil.copy(img, mixed_img_dir / img.name)
             shutil.copy(
-                labeled_lbl_dir / f"{img.stem}.txt",
+                labeled_lbl_dir_train / f"{img.stem}.txt",
                 mixed_lbl_dir / f"{img.stem}.txt",
             )
 
-        for img in unlabeled_img_dir.glob("*"):
+        for img in unlabeled_img_dir_train.glob("*"):
             lbl = pseudo_lbl_dir / f"{img.stem}.txt"
             if lbl.exists():
                 shutil.copy(img, mixed_img_dir / img.name)
                 shutil.copy(lbl, mixed_lbl_dir / lbl.name)
 
         mixed_path = mixed_img_dir.relative_to(work_dir)
-        val_path = val_img_dir.relative_to(work_dir)
+        val_path = labeled_img_dir_val.relative_to(work_dir)
 
         mixed_yaml = work_dir / "mixed.yaml"
         mixed_yaml.write_text(
@@ -354,8 +328,8 @@ class ObjectDetectionExperiment:
 
     def _run_sam3_pseudo(
         self,
-        n_labeled: int,
-        n_val: int,
+        target_objects_train: int,
+        target_objects_val: int,
         train_kwargs: Dict,
         test_kwargs: Dict,
         llm_model: str,
@@ -365,7 +339,7 @@ class ObjectDetectionExperiment:
     ):
         self.logger.info("SAM LABELING")
 
-        work_dir = self.output_root / "sam" / f"n_labeled_{n_labeled}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
+        work_dir = self.output_root / "sam" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
         work_dir.mkdir(parents=True, exist_ok=True)
 
         # ----------------------------------------------------
@@ -374,30 +348,21 @@ class ObjectDetectionExperiment:
         self.logger.info("(1) Prepare sets of labeled and unlabeled samples for training")
 
         train_imgs = sorted(self.dataset.images("train").glob("*.*"))
-        assert n_labeled < len(train_imgs)
 
-        labeled_imgs = self.safe_sample(train_imgs, n_labeled, work_dir, "train images")
-        if labeled_imgs is None:
-            return {}, work_dir
-        unlabeled_imgs = set(train_imgs) - labeled_imgs
+        labeled_img_dir_train = work_dir / "labeled/images"
+        labeled_lbl_dir_train = work_dir / "labeled/labels"
+        unlabeled_img_dir_train = work_dir / "unlabeled/images"
 
-        labeled_img_dir = work_dir / "labeled/images"
-        labeled_lbl_dir = work_dir / "labeled/labels"
-        unlabeled_img_dir = work_dir / "unlabeled/images"
-
-        labeled_img_dir.mkdir(parents=True, exist_ok=True)
-        labeled_lbl_dir.mkdir(parents=True, exist_ok=True)
-        unlabeled_img_dir.mkdir(parents=True, exist_ok=True)
-
-        for img in labeled_imgs:
-            shutil.copy(img, labeled_img_dir / img.name)
-            shutil.copy(
-                self.dataset.labels("train") / f"{img.stem}.txt",
-                labeled_lbl_dir / f"{img.stem}.txt",
-            )
-
-        for img in unlabeled_imgs:
-            shutil.copy(img, unlabeled_img_dir / img.name)
+        stats_train = prepare_labeled_unlabeled_with_object_budget(
+            images=train_imgs,
+            labels_dir=self.dataset.labels("train"),
+            labeled_img_dir=labeled_img_dir_train,
+            labeled_lbl_dir=labeled_lbl_dir_train,
+            unlabeled_img_dir=unlabeled_img_dir_train,
+            target_objects=target_objects_train,
+            rng=self.rng
+        )
+        print(stats_train)
 
         # ----------------------------------------------------
         # (2) Prepare set of labeled samples for validation
@@ -405,27 +370,27 @@ class ObjectDetectionExperiment:
         self.logger.info("(2) Prepare set of labeled samples for validation")
 
         val_imgs = sorted(self.dataset.images("val").glob("*.*"))
-        val_sample = self.safe_sample(val_imgs, n_val, work_dir, "validation images")
-        if val_sample is None:
-            return {}, work_dir
 
-        val_img_dir = work_dir / "val/images"
-        val_lbl_dir = work_dir / "val/labels"
-        val_img_dir.mkdir(parents=True, exist_ok=True)
-        val_lbl_dir.mkdir(parents=True, exist_ok=True)
+        labeled_img_dir_val = work_dir / "val/images"
+        labeled_lbl_dir_val = work_dir / "val/labels"
+        unlabeled_img_val = work_dir / "_tmp_ignore"
 
-        for img in val_sample:
-            shutil.copy(img, val_img_dir / img.name)
-            shutil.copy(
-                self.dataset.labels("val") / f"{img.stem}.txt",
-                val_lbl_dir / f"{img.stem}.txt",
-            )
+        stats_val = prepare_labeled_unlabeled_with_object_budget(
+            images=val_imgs,
+            labels_dir=self.dataset.labels("val"),
+            labeled_img_dir=labeled_img_dir_val,
+            labeled_lbl_dir=labeled_lbl_dir_val,
+            unlabeled_img_dir=unlabeled_img_val,
+            target_objects=target_objects_val,
+            rng=self.rng
+        )
+        print(stats_val)
 
         # ----------------------------------------------------
         # (3) Determine best description for marked objects
         # ----------------------------------------------------
-        train_images, train_labels = load_images_and_labels(labeled_img_dir, labeled_lbl_dir)
-        val_images, val_labels = load_images_and_labels(val_img_dir, val_lbl_dir)
+        train_images, train_labels = load_images_and_labels(labeled_img_dir_train, labeled_lbl_dir_train)
+        val_images, val_labels = load_images_and_labels(labeled_img_dir_val, labeled_lbl_dir_val)
 
         metric = DetectionAP50()
 
@@ -461,17 +426,14 @@ class ObjectDetectionExperiment:
         # ----------------------------------------------------
         self.logger.info("(4) Pseudo labeling pool of unlabeled samples with SAM")
 
-        model_sam = SamSingleton(
-            model_path="resources/sam3.pt",
-            conf_thresh=0.25
-        )
+        model_sam = SamSingleton(model_path="resources/sam3.pt",)
         labeler = SAM3AutoLabeler(model_sam, class_id=0)
 
         pseudo_lbl_dir = work_dir / "pseudo/labels"
         pseudo_lbl_dir.mkdir(parents=True, exist_ok=True)
 
         labeler.label_folder(
-            image_dir=unlabeled_img_dir,
+            image_dir=unlabeled_img_dir_train,
             out_label_dir=pseudo_lbl_dir,
             prompt_filter=prompt_filter,
             visualize=False
@@ -487,21 +449,21 @@ class ObjectDetectionExperiment:
         mixed_img_dir.mkdir(parents=True, exist_ok=True)
         mixed_lbl_dir.mkdir(parents=True, exist_ok=True)
 
-        for img in labeled_img_dir.glob("*"):
+        for img in labeled_img_dir_train.glob("*"):
             shutil.copy(img, mixed_img_dir / img.name)
             shutil.copy(
-                labeled_lbl_dir / f"{img.stem}.txt",
+                labeled_lbl_dir_train / f"{img.stem}.txt",
                 mixed_lbl_dir / f"{img.stem}.txt",
             )
 
-        for img in unlabeled_img_dir.glob("*"):
+        for img in unlabeled_img_dir_train.glob("*"):
             lbl = pseudo_lbl_dir / f"{img.stem}.txt"
             if lbl.exists():
                 shutil.copy(img, mixed_img_dir / img.name)
                 shutil.copy(lbl, mixed_lbl_dir / lbl.name)
 
         mixed_path = mixed_img_dir.relative_to(work_dir)
-        val_path = val_img_dir.relative_to(work_dir)
+        val_path = labeled_img_dir_val.relative_to(work_dir)
 
         mixed_yaml = work_dir / "mixed.yaml"
         mixed_yaml.write_text(
@@ -541,7 +503,7 @@ class ObjectDetectionExperiment:
 
 if __name__ == "__main__":
 
-    REPEATS = 2
+    REPEATS = 1
 
     dataset_name = "medical-pills"
     output_root = Path(f"runs/{dataset_name}")
@@ -575,32 +537,31 @@ if __name__ == "__main__":
     )
     """
 
-    """
     # PSEUDO WEAK YOLO
-    weak_n_labeled_values = [10, 25]
-    for n_labeled in weak_n_labeled_values:
-        print(f"\n=== WEAK YOLO | n_labeled={n_labeled} | repeats={REPEATS} ===")
+    weak_target_objects_train_values = [15]
+    for target_objects_train in weak_target_objects_train_values:
+        print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
         results = exp.run(
             mode=ExperimentMode.WEAK_YOLO_PSEUDO,
-            n_labeled=n_labeled,
-            n_val=n_labeled,
+            target_objects_train=target_objects_train,
+            target_objects_val=target_objects_train,
             train_kwargs=train_kwargs,
             test_kwargs=test_kwargs,
             repeats=REPEATS
         )
-    """
 
     # PSEUDO SAM
-    sam_n_labeled_values = [3, 5]
-    for n_labeled in sam_n_labeled_values:
+    sam_target_objects_train_values = [15]
+    for target_objects_train in sam_target_objects_train_values:
+        print(f"\n=== SAM | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
         results = exp.run(
             mode=ExperimentMode.SAM3_PSEUDO,
-            n_labeled=n_labeled,
-            n_val=n_labeled,
+            target_objects_train=target_objects_train,
+            target_objects_val=target_objects_train,
             train_kwargs=train_kwargs,
             test_kwargs=test_kwargs,
             repeats=REPEATS,
             llm_model="gemma3:latest",
             max_iters_prompt_optimizer=50,
-            max_desc_words=2
+            max_desc_words=10
         )
