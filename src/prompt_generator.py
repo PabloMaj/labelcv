@@ -3,33 +3,28 @@ from typing import List
 
 class PromptGenerator:
     INITIAL_PROMPT = (
-        "Generate short description (max 10 words) of marked objects "
-        "with red rectangles including information about colour, shape "
-        "and characteristic patterns using following images: [IMAGES]. "
-        "Remember to generate a single summary description, not separate descriptions "
-        "for each object in each image. Ignore the red bounding boxes in the description—they "
-        "are included solely to indicate object locations."
-        "Example of possible generated description: "
-        "'elongated dark brown shape with visible spots'."
+        "Generate a short description (max 10 words) of the marked objects "
+        "with red rectangles, including colour, shape, and visual appearance. "
+        "Use the following images: [IMAGES]. "
+        "Generate ONE concise summary description. "
+        "Ignore the red rectangles themselves."
     )
 
     ITER_PROMPT = (
-        "Your task is to generate short description (max 10 words) of marked objects "
-        "with red rectangles including information about colour, shape and characteristic "
-        "patterns using following images: [IMAGES]. "
-        "Remember to generate a single summary description, not separate descriptions "
-        "for each object in each image. Ignore the red bounding boxes in the description—they "
-        "are included solely to indicate object locations."
-        "Example of possible generated description: "
-        "'elongated dark brown shape with visible spots'.\n\n"
-        "Take into account that the generated descriptions are improved in subsequent "
-        "iterations. In previous iterations, the descriptions were as follows, "
-        "along with the assigned computed AP50det between the label proposals "
-        "and the ground truth:\n\n"
+        "Generate a short description (max 10 words) of the marked objects "
+        "with red rectangles, including colour, shape, and visual appearance. "
+        "Use the following images: [IMAGES]. "
+        "Generate ONE concise summary description. "
+        "Ignore the red rectangles themselves."
+
+        "IMPORTANT CONSTRAINTS:\n"
+        "- The description MUST be meaningfully different from previous ones\n\n"
+
+        "Previous best descriptions and their AP50 scores:\n"
         "{history}\n\n"
-        "Considering the results from the previous iterations, generate a better "
-        "description (corresponding to a higher IoU). Try to generate a significantly different description "
-        "each time to capture the most relevant and key words."
+
+        "Generate a new, diverse description that explores a different visual hypothesis. "
+        "Higher IoU is desirable, but diversity is REQUIRED."
     )
 
     @staticmethod
@@ -40,10 +35,16 @@ class PromptGenerator:
 
     @staticmethod
     def build_iterative(images: List[str], history: List[dict]) -> str:
+
         hist_str = "\n".join(
-            f"[{i + 1}] Description: {h['desc']}. IoU: {h['iou']:.4f}"
+            f"[{i + 1}] {h['desc']} → AP50={h['iou']:.4f}"
             for i, h in enumerate(history)
         )
-        return PromptGenerator.ITER_PROMPT.format(history=hist_str).replace(
-            "[IMAGES]", ", ".join(images)
+
+        return (
+            PromptGenerator.ITER_PROMPT
+            .format(
+                history=hist_str
+            )
+            .replace("[IMAGES]", ", ".join(images))
         )

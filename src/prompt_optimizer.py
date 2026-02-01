@@ -22,7 +22,9 @@ class SAM3PromptOptimizer:
         self.llm = OllamaVisionLLM(llm_model)
         self.metric = metric
         self.max_iters = max_iters
-        self.history = []
+        self.history_all = []
+        self.history_topk = []
+        self.top_k = 3
 
     def _predict_masks(self, images, prompt):
         preds = []
@@ -62,10 +64,15 @@ class SAM3PromptOptimizer:
             if it == 0:
                 prompt = PromptGenerator.build_initial(boxed_str)
             else:
-                prompt = PromptGenerator.build_iterative(
-                    boxed_str, self.history
-                )
+                prompt = PromptGenerator.build_iterative(boxed_str, self.history_topk)
             desc = self.llm.inference(prompt, boxed_str)
+            previous_descs = {h["desc"] for h in self.history_topk}
+            if desc in previous_descs:
+                retry_prompt = (
+                    prompt + "\n\nThe generated description was too similar to the best previous ones. "
+                    "Generate a different description."
+                )
+                desc = self.llm.inference(retry_prompt, boxed_str)
 
             # ==========================
             # VAL → METRICS
@@ -94,18 +101,25 @@ class SAM3PromptOptimizer:
                 gt_boxes_all, pred_boxes_all
             )
 
-            self.history.append({
+            self.history_all.append({
+                "iter": it + 1,
                 "desc": desc,
                 "iou": ap50
             })
+
+            self.history_topk = sorted(
+                self.history_all,
+                key=lambda x: x["iou"],
+                reverse=True
+            )[:self.top_k]
 
             print(f"[Iter {it + 1}] {desc} → AP50={ap50:.4f}")
 
         history_file = workdir / "history.json"
         with open(history_file, "w", encoding="utf-8") as f:
-            json.dump(self.history, f, indent=4)
+            json.dump(self.history_all, f, indent=4)
 
-        return max(self.history, key=lambda x: x["iou"])
+        return max(self.history_all, key=lambda x: x["iou"])
 
 
 if __name__ == "__main__":
