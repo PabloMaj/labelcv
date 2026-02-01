@@ -20,6 +20,7 @@ from src.yolo_weak_auto_labeler import WeakYoloSingleton, YOLOWeakAutoLabeler
 from src.prompt_optimizer import SAM3PromptOptimizer
 from src.sam_model import SamSingleton
 from src.sam_auto_labeler import SAM3AutoLabeler
+from src.task_detection import detect_task_from_labels
 
 
 class ExperimentMode(Enum):
@@ -28,7 +29,7 @@ class ExperimentMode(Enum):
     SAM3_PSEUDO = "sam3_pseudo"
 
 
-class ObjectDetectionExperiment:
+class VisionTaskExperiment:
     def __init__(
         self,
         dataset_root: Path,
@@ -37,6 +38,9 @@ class ObjectDetectionExperiment:
         model_type: str,
         random_state: int = 42,
     ):
+        # ------------------------------------------------------------------
+        # Core configuration
+        # ------------------------------------------------------------------
         self.dataset = DatasetLayout(dataset_root)
         self.data_yaml = data_yaml
         self.output_root = output_root
@@ -44,24 +48,39 @@ class ObjectDetectionExperiment:
         self.random_state = random_state
         self.rng = random.Random(random_state)
 
-        # ----------------------------------
-        # READ nc + class names FROM YAML
-        # ----------------------------------
-        with open(self.data_yaml, "r", encoding="utf-8") as f:
+        # ------------------------------------------------------------------
+        # Logging
+        # ------------------------------------------------------------------
+        self.logger = ExperimentLogger(self.output_root)
+
+        # ------------------------------------------------------------------
+        # Dataset metadata (classes, task type)
+        # ------------------------------------------------------------------
+        self.class_names, self.nc = self._load_class_metadata(self.data_yaml)
+        self.task = detect_task_from_labels(self.dataset.labels("train"))
+
+        # ------------------------------------------------------------------
+        # Evaluation
+        # ------------------------------------------------------------------
+        self.metric = DetectionAP50()
+
+        # ------------------------------------------------------------------
+        # Sanity logs
+        # ------------------------------------------------------------------
+        self.logger.info(f"Detected task: {self.task.value}")
+        self.logger.info(f"Classes ({self.nc}): {self.class_names}")
+
+    def _load_class_metadata(self, data_yaml: Path) -> tuple[dict[int, str], int]:
+        with open(data_yaml, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
 
         if "names" not in data:
             raise ValueError("data.yaml must contain 'names' field")
 
-        self.class_names: dict[int, str] = {
-            int(k): v for k, v in data["names"].items()
-        }
-        self.nc: int = len(self.class_names)
-        print(f"self.class_names={self.class_names}")
-        print(f"self.nc={self.nc}")
+        class_names = {int(k): v for k, v in data["names"].items()}
+        nc = len(class_names)
 
-        self.logger = ExperimentLogger(output_root)
-        self.metric = DetectionAP50()
+        return class_names, nc
 
     def _save_metadata(self, work_dir: Path, metadata: dict):
         metadata = dict(metadata)
@@ -505,11 +524,11 @@ if __name__ == "__main__":
 
     REPEATS = 1
 
-    dataset_name = "medical-pills"
+    dataset_name = "crack-seg"
     output_root = Path(f"runs/{dataset_name}")
     data_yaml = f"data/datasets/{dataset_name}/{dataset_name}.yaml"
 
-    exp = ObjectDetectionExperiment(
+    exp = VisionTaskExperiment(
         dataset_root=Path(f"data/datasets/{dataset_name}"),
         data_yaml=data_yaml,
         model_type="yolo11n.pt",
@@ -538,7 +557,7 @@ if __name__ == "__main__":
     """
 
     # PSEUDO WEAK YOLO
-    weak_target_objects_train_values = [15]
+    weak_target_objects_train_values = [30]
     for target_objects_train in weak_target_objects_train_values:
         print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
         results = exp.run(
