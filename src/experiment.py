@@ -10,7 +10,7 @@ from typing import Dict
 
 from ultralytics import YOLO
 
-from src.utils import DetectionAP50, load_images_and_labels
+from src.utils import DetectionAP50, SegmentationAP50, load_images_and_labels
 from src.dataset_preparation import prepare_labeled_unlabeled_with_object_budget
 
 from src.dataset_layout import DatasetLayout
@@ -20,7 +20,7 @@ from src.yolo_weak_auto_labeler import WeakYoloSingleton, YOLOWeakAutoLabeler
 from src.prompt_optimizer import SAM3PromptOptimizer
 from src.sam_model import SamSingleton
 from src.sam_auto_labeler import SAM3AutoLabeler
-from src.task_detection import detect_task_from_labels
+from src.task_detection import TaskType, detect_task_from_labels
 
 
 class ExperimentMode(Enum):
@@ -35,7 +35,7 @@ class VisionTaskExperiment:
         dataset_root: Path,
         data_yaml: str,
         output_root: Path,
-        model_type: str,
+        model_name: str,
         random_state: int = 42,
     ):
         # ------------------------------------------------------------------
@@ -44,7 +44,7 @@ class VisionTaskExperiment:
         self.dataset = DatasetLayout(dataset_root)
         self.data_yaml = data_yaml
         self.output_root = output_root
-        self.model_type = model_type
+        self.model_name = model_name
         self.random_state = random_state
         self.rng = random.Random(random_state)
 
@@ -60,9 +60,14 @@ class VisionTaskExperiment:
         self.task = detect_task_from_labels(self.dataset.labels("train"))
 
         # ------------------------------------------------------------------
-        # Evaluation
+        # Model resolution (task-aware)
         # ------------------------------------------------------------------
-        self.metric = DetectionAP50()
+        self.model_weights = self._resolve_model_weights()
+
+        # ------------------------------------------------------------------
+        # Evaluation metric (task-aware)
+        # ------------------------------------------------------------------
+        self.metric = self._resolve_metric()
 
         # ------------------------------------------------------------------
         # Sanity logs
@@ -81,6 +86,20 @@ class VisionTaskExperiment:
         nc = len(class_names)
 
         return class_names, nc
+
+    def _resolve_metric(self):
+        if self.task == TaskType.DETECT:
+            return DetectionAP50()
+        if self.task == TaskType.SEGMENT:
+            return SegmentationAP50()
+        raise ValueError(f"Unsupported task: {self.task}")
+
+    def _resolve_model_weights(self) -> str:
+        if self.task == TaskType.DETECT:
+            return f"{self.model_name}.pt"
+        if self.task == TaskType.SEGMENT:
+            return f"{self.model_name}-seg.pt"
+        raise ValueError(f"Unsupported task: {self.task}")
 
     def _save_metadata(self, work_dir: Path, metadata: dict):
         metadata = dict(metadata)
@@ -115,7 +134,7 @@ class VisionTaskExperiment:
                 mode=mode.value,
                 repeat_idx=i,
                 seed=seed,
-                model_type=self.model_type,
+                model_weights=self.model_weights,
                 n_labeled=kwargs.get("target_objects_train"),
                 n_val=kwargs.get("target_objects_val"),
                 llm_model=kwargs.get("llm_model"),
@@ -144,7 +163,7 @@ class VisionTaskExperiment:
         self.logger.info("(1) Training model on whole dataset (train + val)")
 
         trainer = YOLOTrainer(
-            model_type=self.model_type,
+            model_weights=self.model_weights,
             data_yaml=str(data_yaml),
             output_dir=work_dir / "train"
         )
@@ -198,7 +217,9 @@ class VisionTaskExperiment:
             labeled_lbl_dir=labeled_lbl_dir_train,
             unlabeled_img_dir=unlabeled_img_dir_train,
             target_objects=target_objects_train,
-            rng=self.rng
+            rng=self.rng,
+            mask_mode="mean",
+            task=self.task.value
         )
         print(stats_train)
 
@@ -220,7 +241,9 @@ class VisionTaskExperiment:
             labeled_lbl_dir=labeled_lbl_dir_val,
             unlabeled_img_dir=unlabeled_img_val,
             target_objects=target_objects_val,
-            rng=self.rng
+            rng=self.rng,
+            mask_mode="mean",
+            task=self.task.value
         )
         print(stats_val)
 
@@ -244,7 +267,7 @@ class VisionTaskExperiment:
         )
 
         trainer1 = YOLOTrainer(
-            model_type=self.model_type,
+            model_weights=self.model_weights,
             data_yaml=str(labeled_yaml),
             output_dir=work_dir / "stage1"
         )
@@ -275,6 +298,7 @@ class VisionTaskExperiment:
             yolo=weak_yolo,
             class_id=0,
             conf_thresh=best_conf,
+            task=self.task.value
         )
 
         pseudo_lbl_dir = work_dir / "pseudo/labels"
@@ -323,7 +347,7 @@ class VisionTaskExperiment:
         )
 
         trainer2 = YOLOTrainer(
-            model_type=self.model_type,
+            model_weights=self.model_weights,
             data_yaml=str(mixed_yaml),
             output_dir=work_dir / "stage2"
         )
@@ -379,7 +403,9 @@ class VisionTaskExperiment:
             labeled_lbl_dir=labeled_lbl_dir_train,
             unlabeled_img_dir=unlabeled_img_dir_train,
             target_objects=target_objects_train,
-            rng=self.rng
+            rng=self.rng,
+            mask_mode="mean",
+            task=self.task.value
         )
         print(stats_train)
 
@@ -401,7 +427,9 @@ class VisionTaskExperiment:
             labeled_lbl_dir=labeled_lbl_dir_val,
             unlabeled_img_dir=unlabeled_img_val,
             target_objects=target_objects_val,
-            rng=self.rng
+            rng=self.rng,
+            mask_mode="mean",
+            task=self.task.value
         )
         print(stats_val)
 
@@ -411,14 +439,12 @@ class VisionTaskExperiment:
         train_images, train_labels = load_images_and_labels(labeled_img_dir_train, labeled_lbl_dir_train)
         val_images, val_labels = load_images_and_labels(labeled_img_dir_val, labeled_lbl_dir_val)
 
-        metric = DetectionAP50()
-
         optimizer = SAM3PromptOptimizer(
             sam_model_path="resources/sam3.pt",
             llm_model=llm_model,
-            metric=metric,
+            task=self.task.value,
             max_iters=max_iters_prompt_optimizer,
-            max_desc_words=max_desc_words
+            max_desc_words=max_desc_words,
         )
 
         prompt_optimizer_dir = work_dir / "prompt_optimizer"
@@ -446,7 +472,7 @@ class VisionTaskExperiment:
         self.logger.info("(4) Pseudo labeling pool of unlabeled samples with SAM")
 
         model_sam = SamSingleton(model_path="resources/sam3.pt",)
-        labeler = SAM3AutoLabeler(model_sam, class_id=0)
+        labeler = SAM3AutoLabeler(sam=model_sam, task=self.task.value, class_id=0)
 
         pseudo_lbl_dir = work_dir / "pseudo/labels"
         pseudo_lbl_dir.mkdir(parents=True, exist_ok=True)
@@ -496,7 +522,7 @@ class VisionTaskExperiment:
         )
 
         trainer = YOLOTrainer(
-            model_type=self.model_type,
+            model_weights=self.model_weights,
             data_yaml=str(mixed_yaml),
             output_dir=work_dir / "yolo_train"
         )
@@ -524,20 +550,20 @@ if __name__ == "__main__":
 
     REPEATS = 1
 
-    dataset_name = "crack-seg"
+    dataset_name = "medical-pills"
     output_root = Path(f"runs/{dataset_name}")
     data_yaml = f"data/datasets/{dataset_name}/{dataset_name}.yaml"
 
     exp = VisionTaskExperiment(
         dataset_root=Path(f"data/datasets/{dataset_name}"),
         data_yaml=data_yaml,
-        model_type="yolo11n.pt",
+        model_name="yolo11n",
         output_root=output_root,
         random_state=42
     )
 
     train_kwargs = dict(
-        epochs=100,
+        epochs=2,
         imgsz=640,
         batch=16,
     )
@@ -546,7 +572,6 @@ if __name__ == "__main__":
         imgsz=640,
     )
 
-    """
     # STANDARD
     results = exp.run(
         mode=ExperimentMode.STANDARD,
@@ -554,10 +579,9 @@ if __name__ == "__main__":
         test_kwargs=test_kwargs,
         repeats=REPEATS
     )
-    """
 
     # PSEUDO WEAK YOLO
-    weak_target_objects_train_values = [30]
+    weak_target_objects_train_values = [5]
     for target_objects_train in weak_target_objects_train_values:
         print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
         results = exp.run(
@@ -570,7 +594,7 @@ if __name__ == "__main__":
         )
 
     # PSEUDO SAM
-    sam_target_objects_train_values = [15]
+    sam_target_objects_train_values = [5]
     for target_objects_train in sam_target_objects_train_values:
         print(f"\n=== SAM | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
         results = exp.run(

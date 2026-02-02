@@ -4,22 +4,22 @@ from typing import Optional
 from tqdm import tqdm
 
 from src.sam_model import SamSingleton
-from src.yolo_bbox_visualizer import YoloBBoxVisualizer
-from src.utils import mask_to_bbox, masks_to_image_space
+from src.yolo_bbox_visualizer import YoloBBoxVisualizer, YoloSegVisualizer
+from src.utils import masks_to_image_space
+from src.mask_processing import mask_to_polygon, polygon_to_bbox
 
 
 class SAM3AutoLabeler:
     def __init__(
         self,
         sam: SamSingleton,
+        task: str = "detect",   # "detect" | "segment"
         class_id: int = 0,
         img_exts=(".jpg", ".jpeg", ".png"),
     ):
-        """
-        sam       : instancja SamSingleton
-        class_id : ID klasy w YOLO
-        """
+        assert task in {"detect", "segment"}
         self.sam = sam
+        self.task = task
         self.class_id = class_id
         self.img_exts = img_exts
 
@@ -31,13 +31,10 @@ class SAM3AutoLabeler:
         visualize: bool = False,
         vis_dir: Optional[Path] = None,
     ):
-        image_dir = Path(image_dir)
-        out_label_dir = Path(out_label_dir)
         out_label_dir.mkdir(parents=True, exist_ok=True)
 
         if visualize:
-            assert vis_dir is not None, "vis_dir must be provided if visualize=True"
-            vis_dir = Path(vis_dir)
+            assert vis_dir is not None
             vis_dir.mkdir(parents=True, exist_ok=True)
 
         images = []
@@ -45,7 +42,7 @@ class SAM3AutoLabeler:
             images.extend(image_dir.glob(f"*{ext}"))
         images = sorted(images)
 
-        for img_path in tqdm(images, desc="Auto-labeling with SAM3"):
+        for img_path in tqdm(images, desc=f"SAM3 auto-labeling [{self.task}]"):
             self._process_single_image(
                 img_path,
                 out_label_dir,
@@ -71,42 +68,76 @@ class SAM3AutoLabeler:
         )
 
         masks = masks_to_image_space(results[0].masks)
-        bboxes = []
-
-        for mask in masks:
-            bbox = mask_to_bbox(mask)
-            if bbox is None:
-                continue
-            bboxes.append(bbox)
 
         label_path = out_label_dir / f"{img_path.stem}.txt"
-        self._save_yolo_labels(label_path, bboxes, w, h)
+
+        if self.task == "detect":
+            bboxes = self._masks_to_bboxes(masks)
+            self._save_yolo_det_labels(label_path, bboxes, w, h)
+
+        else:  # segment
+            polygons = self._masks_to_polygons(masks)
+            self._save_yolo_seg_labels(label_path, polygons, w, h)
 
         if visualize:
             out_img_path = vis_dir / img_path.name
-            YoloBBoxVisualizer.draw_red_boxes(
-                image_path=img_path,
-                label_path=label_path,
-                out_path=out_img_path,
-            )
+            if self.task == "detect":
+                YoloBBoxVisualizer.draw_red_boxes(
+                    img_path, label_path, out_img_path
+                )
+            else:
+                YoloSegVisualizer.draw_polygons(
+                    img_path, label_path, out_img_path
+                )
 
-    def _save_yolo_labels(
-        self,
-        label_path: Path,
-        bboxes,
-        img_w: int,
-        img_h: int,
-    ):
+    # ======================================================
+    # MASK → STRUCTURE
+    # ======================================================
+
+    def _masks_to_polygons(self, masks):
+        polys = []
+        for mask in masks:
+            poly = mask_to_polygon(mask)
+            if poly is not None:
+                polys.append(poly)
+        return polys
+
+    def _masks_to_bboxes(self, masks):
+        bboxes = []
+        for mask in masks:
+            poly = mask_to_polygon(mask)
+            if poly is None:
+                continue
+            bboxes.append(polygon_to_bbox(poly))
+        return bboxes
+
+    # ======================================================
+    # SAVE LABELS
+    # ======================================================
+
+    def _save_yolo_det_labels(self, label_path, bboxes, w, h):
         lines = []
-
         for x1, y1, x2, y2 in bboxes:
-            cx = ((x1 + x2) / 2) / img_w
-            cy = ((y1 + y2) / 2) / img_h
-            bw = (x2 - x1) / img_w
-            bh = (y2 - y1) / img_h
-
+            cx = ((x1 + x2) / 2) / w
+            cy = ((y1 + y2) / 2) / h
+            bw = (x2 - x1) / w
+            bh = (y2 - y1) / h
             lines.append(
                 f"{self.class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
+            )
+
+        with open(label_path, "w") as f:
+            f.write("\n".join(lines))
+
+    def _save_yolo_seg_labels(self, label_path, polygons, w, h):
+        lines = []
+        for poly in polygons:
+            coords = []
+            for x, y in poly:
+                coords.append(f"{x / w:.6f}")
+                coords.append(f"{y / h:.6f}")
+            lines.append(
+                f"{self.class_id} " + " ".join(coords)
             )
 
         with open(label_path, "w") as f:

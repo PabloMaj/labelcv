@@ -7,12 +7,12 @@ class YOLOTrainer:
     """
     Class responsible for training a YOLO model.
     """
-    def __init__(self, model_type: str, data_yaml: str, output_dir: Path):
-        self.model_type = model_type
+    def __init__(self, model_weights: str, data_yaml: str, output_dir: Path):
+        self.model_weights = model_weights
         self.data_yaml = data_yaml
         self.output_dir = output_dir
         # self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.model = YOLO(f"resources/{model_type}")
+        self.model = YOLO(f"resources/{model_weights}")
 
     def train(self, **train_kwargs):
         """
@@ -78,10 +78,10 @@ def main():
     output_dir = Path("runs/yolo_train_eval")
 
     if MODE == "train":
-        model_type = "yolov8m.pt"
+        model_weights = "yolov8m.pt"
 
         trainer = YOLOTrainer(
-            model_type=model_type,
+            model_weights=model_weights,
             data_yaml=data_yaml,
             output_dir=output_dir,
         )

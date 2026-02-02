@@ -11,49 +11,22 @@ from ultralytics import YOLO
 
 class WeakYoloSingleton:
     _instance = None
-    _model = None
 
-    def __new__(
-        cls,
-        model_path: str,
-        conf_thresh: float = 0.25,
-        iou_thresh: float = 0.7,
-        device: str = "cuda",
-    ):
+    def __new__(cls, model_path: str, conf_thresh: float = 0.25, iou_thresh: float = 0.7, device: str = "cuda"):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._init_model(
-                model_path,
-                conf_thresh,
-                iou_thresh,
-                device,
-            )
+            cls._instance._init_model(model_path, conf_thresh, iou_thresh, device)
         return cls._instance
 
-    def _init_model(
-        self,
-        model_path: str,
-        conf_thresh: float,
-        iou_thresh: float,
-        device: str,
-    ):
+    def _init_model(self, model_path: str, conf_thresh: float, iou_thresh: float, device: str):
         self.model_path = model_path
         self.conf_thresh = conf_thresh
         self.iou_thresh = iou_thresh
         self.device = device
-
         self.model = YOLO(model_path)
         self.model.to(device)
 
-    def predict(
-        self,
-        path_to_image: str,
-    ) -> List[Tuple[int, int, int, int, float, int]]:
-        """
-        Returns:
-            List of (x1, y1, x2, y2, conf, class_id) in pixel space
-        """
-
+    def predict(self, path_to_image: str) -> List[Tuple[int, int, int, int, float, int, Optional[List[Tuple[float, float]]]]]:
         results = self.model.predict(
             source=path_to_image,
             conf=self.conf_thresh,
@@ -67,7 +40,10 @@ class WeakYoloSingleton:
         if len(results) == 0:
             return detections
 
-        boxes = results[0].boxes
+        r = results[0]
+        boxes = r.boxes
+        masks = r.masks
+
         if boxes is None:
             return detections
 
@@ -75,126 +51,90 @@ class WeakYoloSingleton:
         confs = boxes.conf.cpu().numpy()
         clss = boxes.cls.cpu().numpy().astype(int)
 
-        for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, clss):
-            detections.append(
-                (
-                    int(x1),
-                    int(y1),
-                    int(x2),
-                    int(y2),
-                    float(conf),
-                    int(cls_id),
-                )
-            )
+        if masks is not None:
+            polys = masks.xy
+        else:
+            polys = [None] * len(xyxy)
+
+        for (x1, y1, x2, y2), conf, cls_id, poly in zip(xyxy, confs, clss, polys):
+            detections.append((int(x1), int(y1), int(x2), int(y2), float(conf), int(cls_id), poly))
 
         return detections
 
 
 class YOLOWeakAutoLabeler:
-    def __init__(
-        self,
-        yolo: WeakYoloSingleton,
-        class_id: int = 0,
-        conf_thresh: float = 0.25,
-        img_exts=(".jpg", ".jpeg", ".png"),
-    ):
-        """
-        yolo        : instancja WeakYoloSingleton
-        class_id    : ID klasy w YOLO (do zapisu etykiet)
-        conf_thresh : minimalna pewność detekcji
-        """
+    def __init__(self, yolo: WeakYoloSingleton, class_id: int = 0, conf_thresh: float = 0.25, task: str = "detect", img_exts=(".jpg", ".jpeg", ".png")):
         self.yolo = yolo
         self.class_id = class_id
         self.conf_thresh = conf_thresh
+        self.task = task
         self.img_exts = img_exts
 
-    def label_folder(
-        self,
-        image_dir: Path,
-        out_label_dir: Path,
-        visualize: bool = False,
-        vis_dir: Optional[Path] = None,
-    ):
+    def label_folder(self, image_dir: Path, out_label_dir: Path, visualize: bool = False, vis_dir: Optional[Path] = None):
         image_dir = Path(image_dir)
         out_label_dir = Path(out_label_dir)
         out_label_dir.mkdir(parents=True, exist_ok=True)
 
         if visualize:
-            assert vis_dir is not None, "vis_dir must be provided if visualize=True"
+            assert vis_dir is not None
             vis_dir = Path(vis_dir)
             vis_dir.mkdir(parents=True, exist_ok=True)
 
-        images = []
-        for ext in self.img_exts:
-            images.extend(image_dir.glob(f"*{ext}"))
-        images = sorted(images)
+        images = sorted([p for ext in self.img_exts for p in image_dir.glob(f"*{ext}")])
 
         for img_path in tqdm(images, desc="Auto-labeling with weak YOLO"):
-            self._process_single_image(
-                img_path,
-                out_label_dir,
-                visualize,
-                vis_dir,
-            )
+            self._process_single_image(img_path, out_label_dir, visualize, vis_dir)
 
-    def _process_single_image(
-        self,
-        img_path: Path,
-        out_label_dir: Path,
-        visualize: bool,
-        vis_dir: Optional[Path],
-    ):
+    def _process_single_image(self, img_path: Path, out_label_dir: Path, visualize: bool, vis_dir: Optional[Path]):
         img = cv2.imread(str(img_path))
         h, w = img.shape[:2]
 
-        detections = self.yolo.predict(
-            path_to_image=str(img_path)
-        )
+        detections = self.yolo.predict(str(img_path))
 
         bboxes = []
+        segments = []
 
         for det in detections:
-            x1, y1, x2, y2, conf, cls = det
-
+            x1, y1, x2, y2, conf, cls, poly = det
             if conf < self.conf_thresh:
                 continue
 
-            # opcjonalnie filtr po klasie modelu
-            # if cls != self.class_id:
-            #     continue
-
-            bboxes.append((x1, y1, x2, y2))
+            if self.task == "detect":
+                bboxes.append((x1, y1, x2, y2))
+            elif self.task == "segment" and poly is not None:
+                segments.append((x1, y1, x2, y2, poly))
 
         label_path = out_label_dir / f"{img_path.stem}.txt"
-        self._save_yolo_labels(label_path, bboxes, w, h)
+
+        if self.task == "detect":
+            self._save_yolo_labels(label_path, bboxes, w, h)
+        else:
+            self._save_yolo_seg_labels(label_path, segments, w, h)
 
         if visualize:
             out_img_path = vis_dir / img_path.name
-            YoloBBoxVisualizer.draw_red_boxes(
-                image_path=img_path,
-                label_path=label_path,
-                out_path=out_img_path,
-            )
+            YoloBBoxVisualizer.draw_red_boxes(image_path=img_path, label_path=label_path, out_path=out_img_path)
 
-    def _save_yolo_labels(
-        self,
-        label_path: Path,
-        bboxes: Iterable,
-        img_w: int,
-        img_h: int,
-    ):
+    def _save_yolo_labels(self, label_path: Path, bboxes: Iterable, img_w: int, img_h: int):
         lines = []
-
         for x1, y1, x2, y2 in bboxes:
             cx = ((x1 + x2) / 2) / img_w
             cy = ((y1 + y2) / 2) / img_h
             bw = (x2 - x1) / img_w
             bh = (y2 - y1) / img_h
+            lines.append(f"{self.class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+        with open(label_path, "w") as f:
+            f.write("\n".join(lines))
 
-            lines.append(
-                f"{self.class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
-            )
-
+    def _save_yolo_seg_labels(self, label_path: Path, segments: Iterable, img_w: int, img_h: int):
+        lines = []
+        for x1, y1, x2, y2, poly in segments:
+            cx = ((x1 + x2) / 2) / img_w
+            cy = ((y1 + y2) / 2) / img_h
+            bw = (x2 - x1) / img_w
+            bh = (y2 - y1) / img_h
+            poly_norm = [f"{px / img_w:.6f} {py / img_h:.6f}" for px, py in poly]
+            lines.append(f"{self.class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f} " + " ".join(poly_norm))
         with open(label_path, "w") as f:
             f.write("\n".join(lines))
 

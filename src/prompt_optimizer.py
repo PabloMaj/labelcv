@@ -6,8 +6,9 @@ from pathlib import Path
 from src.prompt_generator import PromptGenerator
 from src.llm_model import OllamaVisionLLM
 from src.sam_model import SamSingleton
-from src.yolo_bbox_visualizer import YoloBBoxVisualizer
-from src.utils import mask_to_bbox, load_yolo_bboxes, masks_to_image_space, load_images_and_labels, DetectionAP50
+from src.yolo_bbox_visualizer import YoloBBoxVisualizer, YoloSegVisualizer
+from src.utils import mask_to_bbox, load_yolo_bboxes, load_yolo_segment_masks, masks_to_image_space, \
+    load_images_and_labels, DetectionAP50, SegmentationAP50
 
 
 class SAM3PromptOptimizer:
@@ -15,19 +16,41 @@ class SAM3PromptOptimizer:
         self,
         sam_model_path: str,
         llm_model: str,
-        metric: DetectionAP50,
+        task: str,  # "detect" | "segment"
         max_iters: int = 5,
-        max_desc_words: int = 10
+        max_desc_words: int = 10,
     ):
+        assert task in ("detect", "segment")
+
+        self.task = task
         self.sam = SamSingleton(model_path=sam_model_path)
         self.llm = OllamaVisionLLM(llm_model)
-        self.metric = metric
+
+        self.metric = (
+            DetectionAP50()
+            if task == "detect"
+            else SegmentationAP50()
+        )
+
         self.max_iters = max_iters
         self.max_desc_words = max_desc_words
+
         self.history_all = []
         self.history_topk = []
         self.top_k = 3
 
+    # --------------------------------------------------
+    # Visualization
+    # --------------------------------------------------
+    def _visualize_annotations(self, img, lbl, out_path):
+        if self.task == "detect":
+            YoloBBoxVisualizer.draw_red_boxes(img, lbl, out_path)
+        else:
+            YoloSegVisualizer.draw_polygons(img, lbl, out_path)
+
+    # --------------------------------------------------
+    # SAM inference
+    # --------------------------------------------------
     def _predict_masks(self, images, prompt):
         preds = []
         for img in images:
@@ -38,53 +61,15 @@ class SAM3PromptOptimizer:
             preds.append(results[0].masks)
         return preds
 
-    def optimize(
-        self,
-        train_images,
-        train_yolo_labels,
-        val_images,
-        val_yolo_labels,
-        workdir,
-    ):
-        workdir.mkdir(parents=True, exist_ok=True)
-
-        # ==========================
-        # TRAIN → visualization
-        # ==========================
-        boxed_imgs = []
-        for i, (img, lbl) in enumerate(zip(train_images, train_yolo_labels)):
-            out_img = workdir / f"train_boxed_{i}.png"
-            YoloBBoxVisualizer.draw_red_boxes(img, lbl, out_img)
-            boxed_imgs.append(out_img)
-
-        boxed_str = [str(p) for p in boxed_imgs]
-
-        # ==========================
-        # ITERATIONS
-        # ==========================
-        for it in range(self.max_iters):
-            if it == 0:
-                prompt = PromptGenerator.build_initial(boxed_str, max_words=self.max_desc_words)
-            else:
-                prompt = PromptGenerator.build_iterative(boxed_str, self.history_topk, max_words=self.max_desc_words)
-            desc = self.llm.inference(prompt, boxed_str)
-            previous_descs = {h["desc"] for h in self.history_topk}
-            if desc in previous_descs:
-                retry_prompt = (
-                    prompt + "\n\nThe generated description was too similar to the best previous ones. "
-                    "Generate a different description."
-                )
-                desc = self.llm.inference(retry_prompt, boxed_str)
-
-            # ==========================
-            # VAL → METRICS
-            # ==========================
-            pred_masks = self._predict_masks(val_images, desc)
-
-            pred_boxes_all = []
+    # --------------------------------------------------
+    # Evaluation
+    # --------------------------------------------------
+    def _evaluate(self, val_images, val_labels, pred_masks_all):
+        if self.task == "detect":
             gt_boxes_all = []
+            pred_boxes_all = []
 
-            for img, lbl, masks in zip(val_images, val_yolo_labels, pred_masks):
+            for img, lbl, masks in zip(val_images, val_labels, pred_masks_all):
                 img_np = cv2.imread(str(img))
                 h, w = img_np.shape[:2]
 
@@ -99,14 +84,85 @@ class SAM3PromptOptimizer:
                 gt_boxes_all.append(gt_boxes)
                 pred_boxes_all.append(pred_boxes)
 
-            ap50 = self.metric.evaluate_dataset(
-                gt_boxes_all, pred_boxes_all
+            return self.metric.evaluate_dataset(
+                gt_boxes_all,
+                pred_boxes_all
+            )
+
+        else:
+            gt_masks_all = []
+            pred_masks_all_out = []
+
+            for masks in pred_masks_all:
+                pred_masks_all_out.append(masks_to_image_space(masks))
+
+            for img, lbl in zip(val_images, val_labels):
+                img_np = cv2.imread(str(img))
+                h, w = img_np.shape[:2]
+
+                gt_masks = load_yolo_segment_masks(lbl, (h, w))
+                gt_masks_all.append(gt_masks)
+
+            return self.metric.evaluate_dataset(
+                gt_masks_all,
+                pred_masks_all_out
+            )
+
+    # --------------------------------------------------
+    # Optimization loop
+    # --------------------------------------------------
+    def optimize(
+        self,
+        train_images,
+        train_yolo_labels,
+        val_images,
+        val_yolo_labels,
+        workdir,
+    ):
+        workdir.mkdir(parents=True, exist_ok=True)
+
+        # === visualize train annotations ===
+        vis_imgs = []
+        for i, (img, lbl) in enumerate(zip(train_images, train_yolo_labels)):
+            out_img = workdir / f"train_vis_{i}.png"
+            self._visualize_annotations(img, lbl, out_img)
+            vis_imgs.append(out_img)
+
+        vis_imgs_str = [str(p) for p in vis_imgs]
+
+        # === optimization ===
+        for it in range(self.max_iters):
+            if it == 0:
+                prompt = PromptGenerator.build_initial(
+                    vis_imgs_str,
+                    max_words=self.max_desc_words
+                )
+            else:
+                prompt = PromptGenerator.build_iterative(
+                    vis_imgs_str,
+                    self.history_topk,
+                    max_words=self.max_desc_words
+                )
+
+            desc = self.llm.inference(prompt, vis_imgs_str)
+
+            if desc in {h["desc"] for h in self.history_topk}:
+                desc = self.llm.inference(
+                    prompt + "\nGenerate a different description.",
+                    vis_imgs_str
+                )
+
+            pred_masks = self._predict_masks(val_images, desc)
+            score = self._evaluate(
+                val_images,
+                val_yolo_labels,
+                pred_masks
             )
 
             self.history_all.append({
                 "iter": it + 1,
                 "desc": desc,
-                "iou": ap50
+                "iou": score,
             })
 
             self.history_topk = sorted(
@@ -115,10 +171,11 @@ class SAM3PromptOptimizer:
                 reverse=True
             )[:self.top_k]
 
-            print(f"[Iter {it + 1}] {desc} → AP50={ap50:.4f}")
+            print(
+                f"[Iter {it + 1}] ({self.task}) {desc} → score={score:.4f}"
+            )
 
-        history_file = workdir / "history.json"
-        with open(history_file, "w", encoding="utf-8") as f:
+        with open(workdir / "history.json", "w", encoding="utf-8") as f:
             json.dump(self.history_all, f, indent=4)
 
         return max(self.history_all, key=lambda x: x["iou"])

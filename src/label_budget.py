@@ -1,7 +1,8 @@
 import cv2
-import numpy as np
 from pathlib import Path
 import random
+from typing import List
+import shutil
 
 
 def count_objects(label_path: Path) -> int:
@@ -48,54 +49,49 @@ def mask_yolo_bboxes(
     label_path: Path,
     out_img_path: Path,
     out_label_path: Path,
-    keep_indices: list[int],
-    mask_mode: str = "mean",   # "mean" | "black"
-    offset_px: int = 50,        # <<< NOWE
+    keep_indices: List[int],
+    mask_mode: str = "mean",
+    task: str = "detect",
 ):
-    """
-    Masks all YOLO bboxes NOT in keep_indices.
-    Bboxes are expanded by offset_px and clipped to image bounds.
-    """
-
     img = cv2.imread(str(img_path))
     h, w = img.shape[:2]
 
     with open(label_path) as f:
-        lines = f.readlines()
+        lines = [line.strip() for line in f.readlines()]
 
-    kept = [lines[i] for i in keep_indices]
-    masked = [lines[i] for i in range(len(lines)) if i not in keep_indices]
+    new_lines = []
 
-    if mask_mode == "mean":
-        fill_value = img.mean(axis=(0, 1)).astype(np.uint8)
-    else:
-        fill_value = 0
+    for i in keep_indices:
+        line = lines[i]
+        if not line:
+            continue
 
-    for line in masked:
-        _, cx, cy, bw, bh = map(float, line.split())
+        parts = line.split()
+        if len(parts) < 5:
+            continue
 
-        # --- YOLO -> pixel coords ---
-        x1 = int((cx - bw / 2) * w)
-        y1 = int((cy - bh / 2) * h)
-        x2 = int((cx + bw / 2) * w)
-        y2 = int((cy + bh / 2) * h)
+        cls_id = parts[0]
+        cx, cy, bw, bh = map(float, parts[1:5])
 
-        # --- apply offset ---
-        x1 -= offset_px
-        y1 -= offset_px
-        x2 += offset_px
-        y2 += offset_px
+        if task == "segment" and len(parts) > 5:
+            seg_points = list(map(float, parts[5:]))
+        else:
+            seg_points = []
 
-        # --- clip to image ---
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(w, x2)
-        y2 = min(h, y2)
+        if mask_mode == "mean":
+            out_img = img.copy()
+            # opcjonalnie można dodać maskowanie obiektu
+            # np. wypełnić bbox / polygon średnią kolorem tła
+            # tutaj zostawiamy bez zmiany
+            cv2.imwrite(str(out_img_path), out_img)
+        else:
+            shutil.copy(img_path, out_img_path)
 
-        if x2 > x1 and y2 > y1:
-            img[y1:y2, x1:x2] = fill_value
-
-    cv2.imwrite(str(out_img_path), img)
+        # zapis nowej linii w tym samym formacie
+        line_out = f"{cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
+        if seg_points:
+            line_out += " " + " ".join(f"{p:.6f}" for p in seg_points)
+        new_lines.append(line_out)
 
     with open(out_label_path, "w") as f:
-        f.writelines(kept)
+        f.write("\n".join(new_lines))

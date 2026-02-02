@@ -4,20 +4,20 @@ from typing import List
 class PromptGenerator:
     INITIAL_PROMPT = (
         "Generate a short description (max {max_words} words) of the marked objects "
-        "with red rectangles, including colour, shape, and visual appearance. "
+        "with red rectangles or polygons, including colour, shape, and visual appearance. "
         "Use the following images: [IMAGES]. "
         "Generate ONE concise summary description. Use singular form only."
         "Do NOT use plural nouns (e.g. 'cars', 'people')."
-        "Ignore the red rectangles themselves."
+        "Ignore the red rectangles or polygons themselves."
     )
 
     ITER_PROMPT = (
         "Generate a short description (max {max_words} words) of the marked objects "
-        "with red rectangles, including colour, shape, and visual appearance. "
+        "with red rectangles or polygons, including colour, shape, and visual appearance. "
         "Use the following images: [IMAGES]. "
         "Generate ONE concise summary description. Use singular form only."
         "Do NOT use plural nouns (e.g. 'cars', 'people')."
-        "Ignore the red rectangles themselves."
+        "Ignore the red rectangles or polygons themselves."
 
         "IMPORTANT CONSTRAINTS:\n"
         "- The description MUST be meaningfully different from previous ones\n\n"
