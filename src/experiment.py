@@ -548,22 +548,10 @@ class VisionTaskExperiment:
 
 if __name__ == "__main__":
 
-    REPEATS = 1
-
-    dataset_name = "medical-pills"
-    output_root = Path(f"runs/{dataset_name}")
-    data_yaml = f"data/datasets/{dataset_name}/{dataset_name}.yaml"
-
-    exp = VisionTaskExperiment(
-        dataset_root=Path(f"data/datasets/{dataset_name}"),
-        data_yaml=data_yaml,
-        model_name="yolo11n",
-        output_root=output_root,
-        random_state=42
-    )
+    REPEATS = 2
 
     train_kwargs = dict(
-        epochs=2,
+        epochs=50,
         imgsz=640,
         batch=16,
     )
@@ -572,39 +560,52 @@ if __name__ == "__main__":
         imgsz=640,
     )
 
-    # STANDARD
-    results = exp.run(
-        mode=ExperimentMode.STANDARD,
-        train_kwargs=train_kwargs,
-        test_kwargs=test_kwargs,
-        repeats=REPEATS
-    )
+    for dataset_name in ["medical-pills", "crack-seg"]:
 
-    # PSEUDO WEAK YOLO
-    weak_target_objects_train_values = [5]
-    for target_objects_train in weak_target_objects_train_values:
-        print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
+        output_root = Path(f"runs/{dataset_name}")
+        data_yaml = f"data/datasets/{dataset_name}/{dataset_name}.yaml"
+
+        exp = VisionTaskExperiment(
+            dataset_root=Path(f"data/datasets/{dataset_name}"),
+            data_yaml=data_yaml,
+            model_name="yolo11n",
+            output_root=output_root,
+            random_state=42
+        )
+
+        # STANDARD
         results = exp.run(
-            mode=ExperimentMode.WEAK_YOLO_PSEUDO,
-            target_objects_train=target_objects_train,
-            target_objects_val=target_objects_train,
+            mode=ExperimentMode.STANDARD,
             train_kwargs=train_kwargs,
             test_kwargs=test_kwargs,
             repeats=REPEATS
         )
 
-    # PSEUDO SAM
-    sam_target_objects_train_values = [5]
-    for target_objects_train in sam_target_objects_train_values:
-        print(f"\n=== SAM | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
-        results = exp.run(
-            mode=ExperimentMode.SAM3_PSEUDO,
-            target_objects_train=target_objects_train,
-            target_objects_val=target_objects_train,
-            train_kwargs=train_kwargs,
-            test_kwargs=test_kwargs,
-            repeats=REPEATS,
-            llm_model="gemma3:latest",
-            max_iters_prompt_optimizer=50,
-            max_desc_words=10
-        )
+        # PSEUDO WEAK YOLO
+        weak_target_objects_train_values = [25]
+        for target_objects_train in weak_target_objects_train_values:
+            print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
+            results = exp.run(
+                mode=ExperimentMode.WEAK_YOLO_PSEUDO,
+                target_objects_train=target_objects_train,
+                target_objects_val=target_objects_train,
+                train_kwargs=train_kwargs,
+                test_kwargs=test_kwargs,
+                repeats=REPEATS
+            )
+
+        # PSEUDO SAM
+        sam_target_objects_train_values = [10]
+        for target_objects_train in sam_target_objects_train_values:
+            print(f"\n=== SAM | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
+            results = exp.run(
+                mode=ExperimentMode.SAM3_PSEUDO,
+                target_objects_train=target_objects_train,
+                target_objects_val=target_objects_train,
+                train_kwargs=train_kwargs,
+                test_kwargs=test_kwargs,
+                repeats=REPEATS,
+                llm_model="gemma3:latest",
+                max_iters_prompt_optimizer=50,
+                max_desc_words=10
+            )
