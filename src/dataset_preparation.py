@@ -3,7 +3,7 @@ import shutil
 import random
 from typing import List
 
-from src.label_budget import build_image_object_index, sample_by_object_budget, choose_boxes, mask_yolo_bboxes
+from src.label_budget import build_image_object_index, sample_by_object_budget, choose_boxes, mask_bboxes_or_polygons
 
 
 def prepare_labeled_unlabeled_with_object_budget(
@@ -38,7 +38,7 @@ def prepare_labeled_unlabeled_with_object_budget(
 
         keep = choose_boxes(len(lines), remaining, rng)
 
-        mask_yolo_bboxes(
+        mask_bboxes_or_polygons(
             img_path=img,
             label_path=lbl,
             out_img_path=out_img,
