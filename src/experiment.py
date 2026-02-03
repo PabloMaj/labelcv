@@ -110,6 +110,18 @@ class VisionTaskExperiment:
         with open(meta_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(metadata, f, sort_keys=False)
 
+    def _find_best_conf_threshold(self, weights: Path, data_yaml: Path, work_dir: Path) -> float:
+
+        model = YOLO(weights)
+        results = model.val(data=str(data_yaml), save_json=True, plots=True, project=work_dir, name="stage1_conf_score_thresh")
+        f1_curve = results.box.f1_curve.flatten()
+        best_idx = f1_curve.argmax()
+        conf_thresholds = np.linspace(0, 1, len(f1_curve))
+        best_conf = conf_thresholds[best_idx]
+        self.logger.info(f"best_conf={best_conf}")
+
+        return best_conf
+
     def run(self, mode: ExperimentMode, repeats: int = 1, **kwargs):
         self.logger.info(f"Running mode: {mode.value}, repeats={repeats}")
 
@@ -135,15 +147,13 @@ class VisionTaskExperiment:
                 repeat_idx=i,
                 seed=seed,
                 model_weights=self.model_weights,
-                n_labeled=kwargs.get("target_objects_train"),
-                n_val=kwargs.get("target_objects_val"),
-                llm_model=kwargs.get("llm_model"),
-                max_iters_prompt_optimizer=kwargs.get("max_iters_prompt_optimizer"),
-                max_desc_words=kwargs.get("max_desc_words"),
-                train_kwargs=kwargs.get("train_kwargs"),
-                test_kwargs=kwargs.get("test_kwargs"),
                 results=result
             )
+            fields = ["target_objects_train", "target_objects_val", "llm_model", "max_iters_prompt_optimizer",
+                      "max_desc_words", "train_kwargs", "test_kwargs"]
+            for f in fields:
+                if f in kwargs:
+                    metadata[f] = kwargs[f],
 
             self._save_metadata(work_dir, metadata)
             all_results.append(result)
@@ -276,13 +286,7 @@ class VisionTaskExperiment:
         weak_weights = work_dir / "stage1/weights/best.pt"
 
         # additional validation to extract optimal working point (maximazing F1-score)
-        model = YOLO(weak_weights)
-        results = model.val(data=str(labeled_yaml), save_json=True, plots=True, project=work_dir, name="stage1_conf_score_thresh")
-        f1_curve = results.box.f1_curve.flatten()
-        best_idx = f1_curve.argmax()
-        conf_thresholds = np.linspace(0, 1, len(f1_curve))
-        best_conf = conf_thresholds[best_idx]
-        self.logger.info(f"best_conf={best_conf}")
+        best_conf = self._find_best_conf_threshold(weights=weak_weights, data_yaml=labeled_yaml, work_dir=work_dir)
 
         # ----------------------------------------------------
         # (4) Pseudo labeling pool of unlabeled samples
@@ -551,7 +555,7 @@ if __name__ == "__main__":
     REPEATS = 1
 
     train_kwargs = dict(
-        epochs=10,
+        epochs=50,
         imgsz=640,
         batch=16,
     )
@@ -560,7 +564,7 @@ if __name__ == "__main__":
         imgsz=640,
     )
 
-    for dataset_name in ["medical-pills", "crack-seg"][1:]:
+    for dataset_name in ["medical-pills", "crack-seg"]:
 
         output_root = Path(f"runs/{dataset_name}")
         data_yaml = f"data/datasets/{dataset_name}/{dataset_name}.yaml"
@@ -582,7 +586,7 @@ if __name__ == "__main__":
         )
 
         # PSEUDO WEAK YOLO
-        weak_target_objects_train_values = [25]
+        weak_target_objects_train_values = [100]
         for target_objects_train in weak_target_objects_train_values:
             print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
             results = exp.run(

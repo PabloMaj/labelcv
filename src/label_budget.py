@@ -45,7 +45,7 @@ def choose_boxes(n_boxes: int, max_objects: int, rng: random.Random):
 
 
 def mask_bboxes_or_polygons(img_path, label_path, out_img_path, out_label_path,
-                            keep_indices, mask_mode="mean", task="detect"):
+                            keep_indices, mask_mode="black", task="detect", bbox_offset_px: int = 25):
     # Read original image
     img = cv2.imread(str(img_path))
     h, w = img.shape[:2]
@@ -75,13 +75,32 @@ def mask_bboxes_or_polygons(img_path, label_path, out_img_path, out_label_path,
         if task == "detect":
             # YOLO bbox: class x_center y_center width height (normalized)
             xc, yc, bw, bh = map(float, parts[1:])
+
             x1 = int((xc - bw / 2) * w)
             y1 = int((yc - bh / 2) * h)
             x2 = int((xc + bw / 2) * w)
             y2 = int((yc + bh / 2) * h)
 
+            # --- APPLY OFFSET (padding) ---
+            if bbox_offset_px > 0:
+                x1 -= bbox_offset_px
+                y1 -= bbox_offset_px
+                x2 += bbox_offset_px
+                y2 += bbox_offset_px
+
+            # --- CLAMP TO IMAGE ---
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(w, x2)
+            y2 = min(h, y2)
+
+            if x2 <= x1 or y2 <= y1:
+                continue  # safety guard
+
             if mask_mode == "mean":
                 patch = img[y1:y2, x1:x2]
+                if patch.size == 0:
+                    continue
                 color = patch.mean(axis=(0, 1)).astype(int)
                 img[y1:y2, x1:x2] = color
             else:
