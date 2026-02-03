@@ -10,17 +10,17 @@ from typing import Dict
 
 from ultralytics import YOLO
 
-from src.utils import DetectionAP50, SegmentationAP50, load_images_and_labels
-from src.dataset_preparation import prepare_labeled_unlabeled_with_object_budget
-
 from src.dataset_layout import DatasetLayout
+from src.dataset_preparation import prepare_labeled_unlabeled_with_object_budget
 from src.experiment_logger import ExperimentLogger
+from src.loaders import load_images_and_labels
+from src.metrics import DetectionAP50, SegmentationAP50
+from src.prompt_optimizer import SAM3PromptOptimizer
+from src.sam_auto_labeler import SAM3AutoLabeler
+from src.sam_model import SamSingleton
+from src.task_detection import TaskType, detect_task_from_labels
 from src.yolo_train_eval import YOLOTrainer, YOLOEvaluator
 from src.yolo_weak_auto_labeler import WeakYoloSingleton, YOLOWeakAutoLabeler
-from src.prompt_optimizer import SAM3PromptOptimizer
-from src.sam_model import SamSingleton
-from src.sam_auto_labeler import SAM3AutoLabeler
-from src.task_detection import TaskType, detect_task_from_labels
 
 
 class ExperimentMode(Enum):
@@ -548,10 +548,10 @@ class VisionTaskExperiment:
 
 if __name__ == "__main__":
 
-    REPEATS = 2
+    REPEATS = 1
 
     train_kwargs = dict(
-        epochs=50,
+        epochs=10,
         imgsz=640,
         batch=16,
     )
@@ -560,7 +560,7 @@ if __name__ == "__main__":
         imgsz=640,
     )
 
-    for dataset_name in ["medical-pills", "crack-seg"]:
+    for dataset_name in ["medical-pills", "crack-seg"][1:]:
 
         output_root = Path(f"runs/{dataset_name}")
         data_yaml = f"data/datasets/{dataset_name}/{dataset_name}.yaml"
@@ -607,5 +607,5 @@ if __name__ == "__main__":
                 repeats=REPEATS,
                 llm_model="gemma3:latest",
                 max_iters_prompt_optimizer=50,
-                max_desc_words=10
+                max_desc_words=5
             )

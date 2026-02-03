@@ -5,8 +5,7 @@ from tqdm import tqdm
 
 from src.sam_model import SamSingleton
 from src.yolo_bbox_visualizer import YoloBBoxVisualizer, YoloSegVisualizer
-from src.utils import masks_to_image_space
-from src.mask_processing import mask_to_polygon, polygon_to_bbox
+from src.mask_processing import mask_to_polygon, polygon_to_bbox, masks_to_image_space
 
 
 class SAM3AutoLabeler:

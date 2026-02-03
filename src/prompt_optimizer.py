@@ -7,8 +7,9 @@ from src.prompt_generator import PromptGenerator
 from src.llm_model import OllamaVisionLLM
 from src.sam_model import SamSingleton
 from src.yolo_bbox_visualizer import YoloBBoxVisualizer, YoloSegVisualizer
-from src.utils import mask_to_bbox, load_yolo_bboxes, load_yolo_segment_masks, masks_to_image_space, \
-    load_images_and_labels, DetectionAP50, SegmentationAP50
+from src.metrics import DetectionAP50, SegmentationAP50
+from src.loaders import load_yolo_bboxes, load_yolo_segment_masks, load_images_and_labels
+from src.mask_processing import mask_to_bbox, masks_to_image_space
 
 
 class SAM3PromptOptimizer:

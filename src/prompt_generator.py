@@ -9,6 +9,8 @@ class PromptGenerator:
         "Generate ONE concise summary description. Use singular form only."
         "Do NOT use plural nouns (e.g. 'cars', 'people')."
         "Ignore the red rectangles or polygons themselves."
+        "The description must refer exclusively to the object inside the marked region;"
+        "ignore background, scenery, and any contextual elements."
     )
 
     ITER_PROMPT = (
@@ -18,6 +20,8 @@ class PromptGenerator:
         "Generate ONE concise summary description. Use singular form only."
         "Do NOT use plural nouns (e.g. 'cars', 'people')."
         "Ignore the red rectangles or polygons themselves."
+        "The description must refer exclusively to the object inside the marked region;"
+        "ignore background, scenery, and any contextual elements."
 
         "IMPORTANT CONSTRAINTS:\n"
         "- The description MUST be meaningfully different from previous ones\n\n"
