@@ -1,6 +1,7 @@
 
 import cv2
 import json
+import spacy
 from pathlib import Path
 
 from src.prompt_generator import PromptGenerator
@@ -10,6 +11,8 @@ from src.yolo_bbox_visualizer import YoloBBoxVisualizer, YoloSegVisualizer
 from src.metrics import DetectionAP50, SegmentationAP50
 from src.loaders import load_yolo_bboxes, load_yolo_segment_masks, load_images_and_labels
 from src.mask_processing import mask_to_bbox, masks_to_image_space
+
+nlp = spacy.load("en_core_web_sm")
 
 
 class SAM3PromptOptimizer:
@@ -38,7 +41,6 @@ class SAM3PromptOptimizer:
 
         self.history_all = []
         self.history_topk = []
-        self.top_k = 3
 
     # --------------------------------------------------
     # Visualization
@@ -109,6 +111,14 @@ class SAM3PromptOptimizer:
                 pred_masks_all_out
             )
 
+    def extract_clean_singular_nouns(self, text: str):
+        doc = nlp(text)
+        return [
+            token.lemma_.lower()
+            for token in doc
+            if token.pos_ == "NOUN" and token.is_alpha
+        ]
+
     # --------------------------------------------------
     # Optimization loop
     # --------------------------------------------------
@@ -147,35 +157,31 @@ class SAM3PromptOptimizer:
 
             desc = self.llm.inference(prompt, vis_imgs_str, self.max_desc_words)
 
-            if desc in {h["desc"] for h in self.history_topk}:
-                desc = self.llm.inference(
-                    prompt + "\nGenerate a different description.",
-                    vis_imgs_str,
-                    self.max_desc_words
+            # desc and nouns from desc for checking
+            for j, desc_for_check in enumerate([desc] + self.extract_clean_singular_nouns(desc)):
+
+                pred_masks = self._predict_masks(val_images, desc_for_check)
+                score = self._evaluate(
+                    val_images,
+                    val_yolo_labels,
+                    pred_masks
                 )
 
-            pred_masks = self._predict_masks(val_images, desc)
-            score = self._evaluate(
-                val_images,
-                val_yolo_labels,
-                pred_masks
-            )
+                self.history_all.append({
+                    "iter": f"{it + 1}.{j}",
+                    "desc": desc_for_check,
+                    "iou": score,
+                })
 
-            self.history_all.append({
-                "iter": it + 1,
-                "desc": desc,
-                "iou": score,
-            })
+                self.history_topk = sorted(
+                    self.history_all,
+                    key=lambda x: x["iou"],
+                    reverse=True
+                )
 
-            self.history_topk = sorted(
-                self.history_all,
-                key=lambda x: x["iou"],
-                reverse=True
-            )[:self.top_k]
-
-            print(
-                f"[Iter {it + 1}] ({self.task}) {desc} → score={score:.4f}"
-            )
+                print(
+                    f"[Iter {it + 1}.{j}] ({self.task}) {desc} → score={score:.4f}"
+                )
 
         with open(workdir / "history.json", "w", encoding="utf-8") as f:
             json.dump(self.history_all, f, indent=4)

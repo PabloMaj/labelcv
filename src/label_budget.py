@@ -45,7 +45,7 @@ def choose_boxes(n_boxes: int, max_objects: int, rng: random.Random):
 
 
 def mask_bboxes_or_polygons(img_path, label_path, out_img_path, out_label_path,
-                            keep_indices, mask_mode="black", task="detect", bbox_offset_px: int = 25):
+                            keep_indices, mask_mode="black", task="detect", bbox_offset_px: int = 0):
     # Read original image
     img = cv2.imread(str(img_path))
     h, w = img.shape[:2]

@@ -564,10 +564,10 @@ if __name__ == "__main__":
         imgsz=640,
     )
 
-    for dataset_name in ["medical-pills", "crack-seg"]:
+    for dataset_name in ["bee_subset_1"]:
 
         output_root = Path(f"runs/{dataset_name}")
-        data_yaml = f"data/datasets/{dataset_name}/{dataset_name}.yaml"
+        data_yaml = f"data/datasets/{dataset_name}/data.yaml"
 
         exp = VisionTaskExperiment(
             dataset_root=Path(f"data/datasets/{dataset_name}"),
@@ -609,7 +609,7 @@ if __name__ == "__main__":
                 train_kwargs=train_kwargs,
                 test_kwargs=test_kwargs,
                 repeats=REPEATS,
-                llm_model="gemma3:latest",
+                llm_model="ministral-3:latest",
                 max_iters_prompt_optimizer=50,
                 max_desc_words=5
             )
