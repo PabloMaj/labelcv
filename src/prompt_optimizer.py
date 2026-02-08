@@ -145,12 +145,13 @@ class SAM3PromptOptimizer:
                     max_words=self.max_desc_words
                 )
 
-            desc = self.llm.inference(prompt, vis_imgs_str)
+            desc = self.llm.inference(prompt, vis_imgs_str, self.max_desc_words)
 
             if desc in {h["desc"] for h in self.history_topk}:
                 desc = self.llm.inference(
                     prompt + "\nGenerate a different description.",
-                    vis_imgs_str
+                    vis_imgs_str,
+                    self.max_desc_words
                 )
 
             pred_masks = self._predict_masks(val_images, desc)

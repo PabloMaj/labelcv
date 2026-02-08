@@ -6,14 +6,21 @@ class OllamaVisionLLM:
     def __init__(self, model: str):
         self.model = model
 
-    def inference(self, prompt: str, image_paths: List[str]) -> str:
+    def inference(self, prompt: str, image_paths: List[str], max_words: int) -> str:
         messages = [{
             "role": "user",
             "content": prompt,
             "images": image_paths
         }]
         response = chat(model=self.model, messages=messages)
-        return response["message"]["content"].strip()
+        response_raw = response["message"]["content"].strip().lower()
+
+        words = response_raw.split()
+        if not words:
+            return ""
+        trimmed = " ".join(words[:max_words])
+
+        return trimmed
 
 
 if __name__ == "__main__":

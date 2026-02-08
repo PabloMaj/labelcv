@@ -2,97 +2,123 @@ from typing import List
 
 
 class PromptGenerator:
-    INITIAL_PROMPT = (
-        "Generate a short description (max {max_words} words) of the marked objects "
-        "with red rectangles or polygons, including colour, shape, and visual appearance. "
-        "Use the following images: [IMAGES]. "
-        "Generate ONE concise summary description. Use singular form only."
-        "Do NOT use plural nouns (e.g. 'cars', 'people')."
-        "Ignore the red rectangles or polygons themselves."
-        "The description must refer exclusively to the object inside the marked region;"
-        "ignore background, scenery, and any contextual elements."
-    )
-
-    ITER_PROMPT = (
-        "Generate a short description (max {max_words} words) of the marked objects "
-        "with red rectangles or polygons, including colour, shape, and visual appearance. "
-        "Use the following images: [IMAGES]. "
-        "Generate ONE concise summary description. Use singular form only."
-        "Do NOT use plural nouns (e.g. 'cars', 'people')."
-        "Ignore the red rectangles or polygons themselves."
-        "The description must refer exclusively to the object inside the marked region;"
-        "ignore background, scenery, and any contextual elements."
-
-        "IMPORTANT CONSTRAINTS:\n"
-        "- The description MUST be meaningfully different from previous ones\n\n"
-
-        "Previous best descriptions and their AP50 scores:\n"
-        "{history}\n\n"
-
-        "Generate a new, diverse description that explores a different visual hypothesis. "
-        "Higher IoU is desirable, but diversity is REQUIRED."
-    )
-
-    SINGLE_WORD_PROMPT = (
-        "Generate EXACTLY ONE WORD that best describes the marked object "
-        "(e.g. object category, dominant visual concept, or material). "
-        "Use the following images: [IMAGES]. "
-        "Do NOT use articles, adjectives chains, or punctuation. "
-        "Return a single lowercase word only. Use singular form only."
-        "Do NOT use plural nouns (e.g. 'cars', 'people')."
-    )
-
-    SINGLE_WORD_ITER_PROMPT = (
-        "Generate EXACTLY ONE WORD that best describes the marked object "
-        "(e.g. object category, dominant visual concept, or material). "
-        "Use the following images: [IMAGES]. "
-        "Do NOT use articles, adjectives chains, or punctuation. "
-        "Return a single lowercase word only."
-
-        "Previous words and their AP50 scores:\n"
-        "{history}\n\n"
-
-        "Rules:\n"
-        "- Use a single lowercase word\n"
-        "- Do NOT repeat previous words\n"
+    # --------------------------------------------------
+    # Hard constraints (shared)
+    # --------------------------------------------------
+    HARD_RULES = (
+        "OUTPUT FORMAT RULES (MANDATORY):\n"
+        "- Output EXACTLY one noun as the head word\n"
+        "- You MAY add optional adjectives BEFORE the noun\n"
+        "- Total number of words MUST be <= {max_words}\n"
+        "- Do NOT use verbs\n"
+        "- Do NOT use commas, periods, or punctuation\n"
+        "- Do NOT mention professions, roles, or activities\n"
+        "- Do NOT mention background, scene, or context\n"
+        "- Describe ONLY what is visually inside the marked region\n"
         "- Use singular form only\n"
-        "- Do NOT use plural nouns (e.g. 'cars', 'people')"
+        "- Use lowercase only\n"
+        "- Do NOT include any scores, metrics, or previous text\n"
     )
 
-    @staticmethod
-    def build_initial(images: List[str], max_words: int) -> str:
-        if max_words == 1:
-            return (
-                PromptGenerator.SINGLE_WORD_PROMPT
-                .replace("[IMAGES]", ", ".join(images))
-            )
+    # --------------------------------------------------
+    # Initial prompt
+    # --------------------------------------------------
+    INITIAL_PROMPT = (
+        "You are given MULTIPLE images.\n"
+        "Each image contains a red-marked region indicating the target object.\n\n"
 
+        "Your task is to produce ONE short visual description that is TRUE for "
+        "ALL marked objects across ALL images.\n\n"
+
+        "If a visual property is not shared by every marked object, "
+        "you MUST NOT include it.\n\n"
+
+        "The description must:\n"
+        "- use EXACTLY one noun with optional adjectives\n"
+        "- describe a common visual characteristic shared by all objects\n"
+        "- be valid for every marked region\n\n"
+
+        "Focus on:\n"
+        "- common shape or silhouette\n"
+        "- common clothing or worn item\n"
+        "- common material or texture\n"
+        "- common color or color placement\n\n"
+
+        "Use the following images: [IMAGES]\n\n"
+        "{rules}"
+
+        "In the response, include only the description without any additional explanation."
+    )
+
+    # --------------------------------------------------
+    # Iterative prompt
+    # --------------------------------------------------
+    ITER_PROMPT = (
+        "Generate a NEW visual description that applies to "
+        "ALL marked objects in ALL images.\n\n"
+
+        "The description must:\n"
+        "- contain EXACTLY one noun with optional adjectives\n"
+        "- use at most {max_words} words\n"
+        "- represent a DIFFERENT shared visual hypothesis "
+        "than previous descriptions\n\n"
+
+        "IMPORTANT:\n"
+        "- If a feature appears only in some images, do NOT use it\n"
+        "- Prefer properties that are consistently visible\n\n"
+
+        "Choose ONE new shared focus:\n"
+        "- overall silhouette or contour\n"
+        "- consistently worn clothing or equipment\n"
+        "- dominant material common to all objects\n"
+        "- dominant color present in all marked regions\n\n"
+
+        "Previous descriptions (for diversity only, do NOT copy):\n"
+        "{history}\n\n"
+
+        "Use the following images: [IMAGES]\n\n"
+        "{rules}"
+
+        "In the response, include only the description without any additional explanation."
+    )
+
+    # --------------------------------------------------
+    # Builders
+    # --------------------------------------------------
+    @staticmethod
+    def build_initial(
+        images: List[str],
+        max_words: int,
+    ) -> str:
         return (
             PromptGenerator.INITIAL_PROMPT
-            .format(max_words=max_words)
+            .format(
+                rules=PromptGenerator.HARD_RULES.format(
+                    max_words=max_words
+                )
+            )
             .replace("[IMAGES]", ", ".join(images))
         )
 
     @staticmethod
-    def build_iterative(images: List[str], history: List[dict], max_words: int) -> str:
-
+    def build_iterative(
+        images: List[str],
+        history: List[dict],
+        max_words: int,
+    ) -> str:
         hist_str = "\n".join(
-            f"[{i + 1}] {h['desc']} → AP50={h['iou']:.4f}"
-            for i, h in enumerate(history)
+            f"- {h['desc']}"
+            for h in history
         )
-
-        if max_words == 1:
-            return (
-                PromptGenerator.SINGLE_WORD_ITER_PROMPT
-                .format(history=hist_str)
-                .replace("[IMAGES]", ", ".join(images))
-            )
 
         return (
             PromptGenerator.ITER_PROMPT
             .format(
-                max_words=max_words,
                 history=hist_str,
+                max_words=max_words,
+                rules=PromptGenerator.HARD_RULES.format(
+                    max_words=max_words
+                ),
             )
             .replace("[IMAGES]", ", ".join(images))
         )
