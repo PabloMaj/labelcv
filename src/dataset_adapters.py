@@ -63,7 +63,7 @@ class YoloDatasetFilter:
 
                 with open(label_file) as f:
                     for line in f:
-                        if int(line.split()[0]) == class_id:
+                        if len(line) > 1 and int(line.split()[0]) == class_id:
                             # remap ID -> 0
                             parts = line.split()
                             parts[0] = "0"
@@ -205,12 +205,14 @@ if __name__ == "__main__":
     # datasets with many classes (construction-ppe, african-wildlife)
     allowed_classes_per_dataset = {
         "construction-ppe": ["helmet", "gloves", "vest", "goggles"],
-        "african-wildlife": ["buffalo", "elephant", "rhino", "zebra"]
+        "african-wildlife": ["buffalo", "elephant", "rhino", "zebra"],
+        "homeobjects": ["chair", "table", "lamp", "potted plant"]
+
     }
 
     path_to_datasets = "data/datasets/"
 
-    for dataset_name in ["construction-ppe", "african-wildlife"]:
+    for dataset_name in ["construction-ppe", "african-wildlife", "homeobjects"]:
 
         yaml_file_name = [el for el in os.listdir(path_to_datasets + dataset_name) if "yaml" in el][0]
 
