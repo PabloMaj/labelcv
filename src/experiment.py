@@ -2,12 +2,12 @@ import random
 import shutil
 import yaml
 import numpy as np
-from datetime import datetime
+import torch
 
+from datetime import datetime
 from pathlib import Path
 from enum import Enum
 from typing import Dict
-
 from ultralytics import YOLO
 
 from src.dataset_layout import DatasetLayout
@@ -132,6 +132,8 @@ class VisionTaskExperiment:
             self.rng.seed(seed)
 
             self.logger.info(f"=== REPEAT {i + 1}/{repeats} (seed={seed}) ===")
+
+            torch.cuda.empty_cache()
 
             if mode == ExperimentMode.STANDARD:
                 result, work_dir = self._run_standard(repeat_idx=i, **kwargs)
@@ -555,13 +557,15 @@ if __name__ == "__main__":
     REPEATS = 1
     DATASET_NAMES = ["bee_subset_1", "african-wildlife_buffalo", "african-wildlife_elephant", "african-wildlife_rhino",
                      "african-wildlife_zebra", "construction-ppe_gloves", "construction-ppe_goggles", "construction-ppe_helmet",
-                     "construction-ppe_vest", "crack-seg", "wheat_arvalis_1", "wheat_arvalis_3", "wheat_ethz_1", "wheat_rres_1"]
+                     "construction-ppe_vest", "crack-seg", "wheat_arvalis_1", "wheat_arvalis_3", "wheat_ethz_1", "wheat_rres_1",
+                     "homeobjects_chair", "homeobjects_table", "homeobjects_potted plant", "homeobjects_lamp"]
     print(f"No of datasets: {len(DATASET_NAMES)}")
 
     train_kwargs = dict(
         epochs=50,
         imgsz=640,
         batch=16,
+        workers=0
     )
 
     test_kwargs = dict(
