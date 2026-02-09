@@ -553,6 +553,10 @@ class VisionTaskExperiment:
 if __name__ == "__main__":
 
     REPEATS = 1
+    DATASET_NAMES = ["bee_subset_1", "african-wildlife_buffalo", "african-wildlife_elephant", "african-wildlife_rhino",
+                     "african-wildlife_zebra", "construction-ppe_gloves", "construction-ppe_goggles", "construction-ppe_helmet",
+                     "construction-ppe_vest", "crack-seg", "wheat_arvalis_1", "wheat_arvalis_3", "wheat_ethz_1", "wheat_rres_1"]
+    print(f"No of datasets: {len(DATASET_NAMES)}")
 
     train_kwargs = dict(
         epochs=50,
@@ -564,7 +568,7 @@ if __name__ == "__main__":
         imgsz=640,
     )
 
-    for dataset_name in ["bee_subset_1"]:
+    for dataset_name in DATASET_NAMES:
 
         output_root = Path(f"runs/{dataset_name}")
         data_yaml = f"data/datasets/{dataset_name}/data.yaml"

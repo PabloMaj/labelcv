@@ -1,4 +1,4 @@
-from ollama import chat
+import ollama
 from typing import List
 
 
@@ -12,13 +12,19 @@ class OllamaVisionLLM:
             "content": prompt,
             "images": image_paths
         }]
-        response = chat(model=self.model, messages=messages)
-        response_raw = response["message"]["content"].strip().lower()
+        client = ollama.Client(timeout=60)
 
-        words = response_raw.split()
-        if not words:
-            return ""
-        trimmed = " ".join(words[:max_words])
+        try:
+            response = client.chat(model=self.model, messages=messages)
+            response_raw = response["message"]["content"].strip().lower()
+
+            words = response_raw.split()
+            if not words:
+                return ""
+            trimmed = " ".join(words[:max_words])
+        except Exception as e:
+            print(f"Request timed out: {e}")
+            return "timeout"
 
         return trimmed
 
