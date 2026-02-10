@@ -3,6 +3,7 @@ import shutil
 import yaml
 import numpy as np
 import torch
+import gc
 
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,12 @@ from src.sam_model import SamSingleton
 from src.task_detection import TaskType, detect_task_from_labels
 from src.yolo_train_eval import YOLOTrainer, YOLOEvaluator
 from src.yolo_weak_auto_labeler import WeakYoloSingleton, YOLOWeakAutoLabeler
+
+
+def cuda_cleanup():
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 
 class ExperimentMode(Enum):
@@ -113,12 +120,17 @@ class VisionTaskExperiment:
     def _find_best_conf_threshold(self, weights: Path, data_yaml: Path, work_dir: Path) -> float:
 
         model = YOLO(weights)
-        results = model.val(data=str(data_yaml), save_json=True, plots=True, project=work_dir, name="stage1_conf_score_thresh")
+        with torch.no_grad():
+            results = model.val(data=str(data_yaml), save_json=True, plots=True, project=work_dir, name="stage1_conf_score_thresh")
         f1_curve = results.box.f1_curve.flatten()
         best_idx = f1_curve.argmax()
         conf_thresholds = np.linspace(0, 1, len(f1_curve))
         best_conf = conf_thresholds[best_idx]
         self.logger.info(f"best_conf={best_conf}")
+
+        del results
+        del model
+        cuda_cleanup()
 
         return best_conf
 
@@ -133,7 +145,7 @@ class VisionTaskExperiment:
 
             self.logger.info(f"=== REPEAT {i + 1}/{repeats} (seed={seed}) ===")
 
-            torch.cuda.empty_cache()
+            cuda_cleanup()
 
             if mode == ExperimentMode.STANDARD:
                 result, work_dir = self._run_standard(repeat_idx=i, **kwargs)
@@ -183,6 +195,9 @@ class VisionTaskExperiment:
         _ = trainer.train(**train_kwargs, project=work_dir, name="train")
         final_weights = work_dir / "train/weights/best.pt"
 
+        del trainer
+        cuda_cleanup()
+
         # ----------------------------------------------------
         # (2) Final evaluation using test set
         # ----------------------------------------------------
@@ -195,6 +210,9 @@ class VisionTaskExperiment:
         )
 
         test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
+
+        del evaluator
+        cuda_cleanup()
 
         return test_results.results_dict, work_dir
 
@@ -287,6 +305,9 @@ class VisionTaskExperiment:
         _ = trainer1.train(**train_kwargs, project=work_dir, name="stage1")
         weak_weights = work_dir / "stage1/weights/best.pt"
 
+        del trainer1
+        cuda_cleanup()
+
         # additional validation to extract optimal working point (maximazing F1-score)
         best_conf = self._find_best_conf_threshold(weights=weak_weights, data_yaml=labeled_yaml, work_dir=work_dir)
 
@@ -314,6 +335,11 @@ class VisionTaskExperiment:
             image_dir=unlabeled_img_dir_train,
             out_label_dir=pseudo_lbl_dir,
         )
+
+        del labeler
+        del weak_yolo
+        WeakYoloSingleton._instance = None
+        cuda_cleanup()
 
         # ----------------------------------------------------
         # (5) Mixed train with samples with labels and pseudo-labels
@@ -361,6 +387,9 @@ class VisionTaskExperiment:
         _ = trainer2.train(**train_kwargs, project=work_dir, name="stage2")
         final_weights = work_dir / "stage2/weights/best.pt"
 
+        del trainer2
+        cuda_cleanup()
+
         # ----------------------------------------------------
         # (6) Final evaluation using test set
         # ----------------------------------------------------
@@ -373,6 +402,10 @@ class VisionTaskExperiment:
         )
 
         test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
+
+        del evaluator
+        cuda_cleanup()
+
         return test_results.results_dict, work_dir
 
     def _run_sam3_pseudo(
@@ -464,6 +497,9 @@ class VisionTaskExperiment:
             workdir=prompt_optimizer_dir
         )
 
+        del optimizer
+        cuda_cleanup()
+
         self.logger.info(f"BEST PROMPT:\n{best['desc']}\nAP50: {best['iou']:.4f}")
         best_prompt_file = work_dir / "best_prompt.txt"
         with open(best_prompt_file, "w", encoding="utf-8") as f:
@@ -489,6 +525,11 @@ class VisionTaskExperiment:
             prompt_filter=prompt_filter,
             visualize=False
         )
+
+        del labeler
+        del model_sam
+        SamSingleton._instance = None
+        cuda_cleanup()
 
         # ----------------------------------------------------
         # (5) Mixed train with samples with labels and pseudo-labels
@@ -536,6 +577,9 @@ class VisionTaskExperiment:
         _ = trainer.train(**train_kwargs, project=work_dir, name="yolo_train")
         final_weights = work_dir / "yolo_train/weights/best.pt"
 
+        del trainer
+        cuda_cleanup()
+
         # ----------------------------------------------------
         # (6) Final evaluation using test set
         # ----------------------------------------------------
@@ -549,23 +593,25 @@ class VisionTaskExperiment:
 
         test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
 
+        del evaluator
+        cuda_cleanup()
+
         return test_results.results_dict, work_dir
 
 
 if __name__ == "__main__":
 
-    REPEATS = 1
+    REPEATS = 5
     DATASET_NAMES = ["bee_subset_1", "african-wildlife_buffalo", "african-wildlife_elephant", "african-wildlife_rhino",
                      "african-wildlife_zebra", "construction-ppe_gloves", "construction-ppe_goggles", "construction-ppe_helmet",
                      "construction-ppe_vest", "crack-seg", "wheat_arvalis_1", "wheat_arvalis_3", "wheat_ethz_1", "wheat_rres_1",
-                     "homeobjects_chair", "homeobjects_table", "homeobjects_potted plant", "homeobjects_lamp"]
+                     "homeobjects_chair", "homeobjects_table", "homeobjects_potted plant", "homeobjects_lamp"][1:2]
     print(f"No of datasets: {len(DATASET_NAMES)}")
 
     train_kwargs = dict(
         epochs=50,
         imgsz=640,
         batch=16,
-        workers=0
     )
 
     test_kwargs = dict(
@@ -585,6 +631,7 @@ if __name__ == "__main__":
             random_state=42
         )
 
+        """
         # STANDARD
         results = exp.run(
             mode=ExperimentMode.STANDARD,
@@ -592,9 +639,10 @@ if __name__ == "__main__":
             test_kwargs=test_kwargs,
             repeats=REPEATS
         )
+        """
 
         # PSEUDO WEAK YOLO
-        weak_target_objects_train_values = [100]
+        weak_target_objects_train_values = [10, 20, 40, 80]
         for target_objects_train in weak_target_objects_train_values:
             print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
             results = exp.run(
@@ -606,6 +654,7 @@ if __name__ == "__main__":
                 repeats=REPEATS
             )
 
+        """
         # PSEUDO SAM
         sam_target_objects_train_values = [10]
         for target_objects_train in sam_target_objects_train_values:
@@ -621,3 +670,4 @@ if __name__ == "__main__":
                 max_iters_prompt_optimizer=50,
                 max_desc_words=5
             )
+        """
