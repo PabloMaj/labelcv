@@ -1,5 +1,6 @@
 
 import cv2
+import re
 import json
 import spacy
 from pathlib import Path
@@ -111,13 +112,17 @@ class SAM3PromptOptimizer:
                 pred_masks_all_out
             )
 
-    def extract_clean_singular_nouns(self, text: str):
+    def extract_all_nouns(self, text: str):
+        text = re.sub(r"`{3,}.*", "", text, flags=re.DOTALL).strip()
         doc = nlp(text)
         return [
             token.lemma_.lower()
             for token in doc
-            if token.pos_ == "NOUN" and token.is_alpha
+            if token.pos_ in {"NOUN", "PROPN"} and token.is_alpha
         ]
+
+    def clean_trailing_backticks(self, text: str) -> str:
+        return re.sub(r"\s*`{3,}.*$", "", text).strip()
 
     # --------------------------------------------------
     # Optimization loop
@@ -158,7 +163,7 @@ class SAM3PromptOptimizer:
             desc = self.llm.inference(prompt, vis_imgs_str, self.max_desc_words)
 
             # desc and nouns from desc for checking
-            for j, desc_for_check in enumerate([desc] + self.extract_clean_singular_nouns(desc)):
+            for j, desc_for_check in enumerate([self.clean_trailing_backticks(desc)] + self.extract_all_nouns(desc)):
 
                 pred_masks = self._predict_masks(val_images, desc_for_check)
                 score = self._evaluate(
