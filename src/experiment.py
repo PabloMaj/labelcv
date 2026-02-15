@@ -26,8 +26,9 @@ from src.yolo_weak_auto_labeler import WeakYoloSingleton, YOLOWeakAutoLabeler
 
 def cuda_cleanup():
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 class ExperimentMode(Enum):
@@ -188,7 +189,7 @@ class VisionTaskExperiment:
 
         trainer = YOLOTrainer(
             model_weights=self.model_weights,
-            data_yaml=str(data_yaml),
+            data_yaml=str(self.data_yaml),
             output_dir=work_dir / "train"
         )
 
@@ -601,17 +602,18 @@ class VisionTaskExperiment:
 
 if __name__ == "__main__":
 
-    REPEATS = 5
+    REPEATS = 3
     DATASET_NAMES = ["bee_subset_1", "african-wildlife_buffalo", "african-wildlife_elephant", "african-wildlife_rhino",
                      "african-wildlife_zebra", "construction-ppe_gloves", "construction-ppe_goggles", "construction-ppe_helmet",
                      "construction-ppe_vest", "crack-seg", "wheat_arvalis_1", "wheat_arvalis_3", "wheat_ethz_1", "wheat_rres_1",
-                     "homeobjects_chair", "homeobjects_table", "homeobjects_potted plant", "homeobjects_lamp"][1:2]
+                     "homeobjects_chair", "homeobjects_table", "homeobjects_potted_plant", "homeobjects_lamp"]
     print(f"No of datasets: {len(DATASET_NAMES)}")
 
     train_kwargs = dict(
-        epochs=50,
+        epochs=200,
         imgsz=640,
         batch=16,
+        patience=20
     )
 
     test_kwargs = dict(
@@ -642,7 +644,7 @@ if __name__ == "__main__":
         """
 
         # PSEUDO WEAK YOLO
-        weak_target_objects_train_values = [10, 20, 40, 80]
+        weak_target_objects_train_values = [40]
         for target_objects_train in weak_target_objects_train_values:
             print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
             results = exp.run(
@@ -656,7 +658,7 @@ if __name__ == "__main__":
 
         """
         # PSEUDO SAM
-        sam_target_objects_train_values = [10]
+        sam_target_objects_train_values = [20]
         for target_objects_train in sam_target_objects_train_values:
             print(f"\n=== SAM | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
             results = exp.run(
