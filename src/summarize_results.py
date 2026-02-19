@@ -3,6 +3,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import re
+import matplotlib.pyplot as plt
 
 
 class ExperimentSummarizer:
@@ -115,11 +116,29 @@ class ExperimentSummarizer:
 
         return g[cols].sort_values(group_cols)
 
+    def plot_ap50_vs_nlabels(self, df: pd.DataFrame):
+        x = [10, 20, 40, 80]
+        plt.figure()
+
+        for m in ["only_labeled", "weak_yolo", "sam"]:
+            y = (df[df.method == m].sort_values("n_labels")["AP50"])
+            plt.plot(x, y, marker="o", label=m)
+
+        ap_std = df[df.method == "standard_yolo"]["AP50"].iloc[0]
+        plt.plot(x, [ap_std] * 4, marker="o", label="standard_yolo")
+
+        plt.xlabel("n_labels")
+        plt.ylabel("AP50")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("chart_results.png", dpi=300)
+
 
 if __name__ == "__main__":
     ROOT_DIR = "../runs/"
     OUTPUT_CSV = "results_summary.csv"
-    AVERAGE_OVER_DATASETS = False
+    AVERAGE_OVER_DATASETS = True
 
     summarizer = ExperimentSummarizer(ROOT_DIR)
     df = summarizer.summarize(average_over_datasets=AVERAGE_OVER_DATASETS)
@@ -128,3 +147,6 @@ if __name__ == "__main__":
 
     if OUTPUT_CSV is not None:
         df.to_csv(OUTPUT_CSV, index=False)
+
+    df["AP50"] = df["AP50"].astype("float16")
+    summarizer.plot_ap50_vs_nlabels(df)
