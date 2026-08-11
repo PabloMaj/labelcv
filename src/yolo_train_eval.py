@@ -38,6 +38,49 @@ class YOLOTrainer:
 
         return results
 
+    def train_distill(
+            self,
+            distill_model: str,
+            dis: float = 6.0,
+            **train_kwargs,
+        ):
+        """
+        Run YOLO training, optionally using knowledge distillation.
+        """
+    
+        train_args = {
+                "data": self.data_yaml,
+                **train_kwargs,
+        }
+    
+        if distill_model is not None:
+            train_args["distill_model"] = distill_model
+            train_args["dis"] = dis
+    
+        results = self.model.train(**train_args)
+    
+        history_path = self.output_dir / "train_history.json"
+        best_val_path = self.output_dir / "best_val_metrics.json"
+    
+        history = (
+            results.results_dict
+            if hasattr(results, "results_dict")
+            else {}
+        )
+    
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+    
+        best_metrics = {}
+    
+        if hasattr(results, "best"):
+            best_metrics = results.best
+    
+        with open(best_val_path, "w", encoding="utf-8") as f:
+            json.dump(best_metrics, f, indent=2)
+    
+        return results
+    
 
 class YOLOEvaluator:
     """

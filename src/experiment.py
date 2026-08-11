@@ -22,6 +22,7 @@ from src.sam_model import SamSingleton
 from src.task_detection import TaskType, detect_task_from_labels
 from src.yolo_train_eval import YOLOTrainer, YOLOEvaluator
 from src.yolo_weak_auto_labeler import WeakYoloSingleton, YOLOWeakAutoLabeler
+from src.utv2 import UnbiasedTeacherV2Trainer
 
 
 def cuda_cleanup():
@@ -35,6 +36,8 @@ class ExperimentMode(Enum):
     STANDARD = "standard"
     WEAK_YOLO_PSEUDO = "weak_yolo_pseudo"
     SAM3_PSEUDO = "sam3_pseudo"
+    WEAK_YOLO_KD = "weak_yolo_kd"
+    WEAK_YOLO_UNBIASED_TEACHER = "weak_yolo_unbiased_teacher"
 
 
 class VisionTaskExperiment:
@@ -154,6 +157,10 @@ class VisionTaskExperiment:
                 result, work_dir = self._run_weak_yolo_pseudo(repeat_idx=i, **kwargs)
             elif mode == ExperimentMode.SAM3_PSEUDO:
                 result, work_dir = self._run_sam3_pseudo(repeat_idx=i, **kwargs)
+            elif mode == ExperimentMode.WEAK_YOLO_KD:
+                result, work_dir = self._run_knowledge_distillation(repeat_idx=i, **kwargs)
+            elif mode == ExperimentMode.WEAK_YOLO_UNBIASED_TEACHER:
+                result, work_dir = self._run_unbiased_teacher(repeat_idx=i, **kwargs)
             else:
                 raise ValueError(f"Unsupported mode: {mode}")
 
@@ -216,6 +223,407 @@ class VisionTaskExperiment:
         cuda_cleanup()
 
         return test_results.results_dict, work_dir
+
+    def _run_knowledge_distillation(
+            self,
+            target_objects_train: int,
+            target_objects_val: int,
+            train_kwargs: Dict,
+            test_kwargs: Dict,
+            repeat_idx: int = 0
+        ):
+            self.logger.info("KNOWLEDGE DISTILLATION")
+    
+            work_dir = self.output_root / "weak_yolo" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
+            work_dir.mkdir(parents=True, exist_ok=True)
+    
+            # ----------------------------------------------------
+            # (1) Prepare sets of labeled and unlabeled samples for training
+            # ----------------------------------------------------
+            self.logger.info("(1) Prepare sets of labeled and unlabeled samples for training")
+    
+            labeled_img_dir_train = work_dir / "labeled/images"
+            labeled_lbl_dir_train = work_dir / "labeled/labels"
+            unlabeled_img_dir_train = work_dir / "unlabeled/images"
+    
+            train_imgs = sorted(self.dataset.images("train").glob("*.*"))
+    
+            stats_train = prepare_labeled_unlabeled_with_object_budget(
+                images=train_imgs,
+                labels_dir=self.dataset.labels("train"),
+                labeled_img_dir=labeled_img_dir_train,
+                labeled_lbl_dir=labeled_lbl_dir_train,
+                unlabeled_img_dir=unlabeled_img_dir_train,
+                target_objects=target_objects_train,
+                rng=self.rng,
+                mask_mode="mean",
+                task=self.task.value
+            )
+            print(stats_train)
+    
+            # ----------------------------------------------------
+            # (2) Prepare set of labeled samples for validation
+            # ----------------------------------------------------
+            self.logger.info("(2) Prepare set of labeled samples for validation")
+    
+            labeled_img_dir_val = work_dir / "val/images"
+            labeled_lbl_dir_val = work_dir / "val/labels"
+            unlabeled_img_val = work_dir / "_tmp_ignore"
+    
+            val_imgs = sorted(self.dataset.images("val").glob("*.*"))
+    
+            stats_val = prepare_labeled_unlabeled_with_object_budget(
+                images=val_imgs,
+                labels_dir=self.dataset.labels("val"),
+                labeled_img_dir=labeled_img_dir_val,
+                labeled_lbl_dir=labeled_lbl_dir_val,
+                unlabeled_img_dir=unlabeled_img_val,
+                target_objects=target_objects_val,
+                rng=self.rng,
+                mask_mode="mean",
+                task=self.task.value
+            )
+            print(stats_val)
+    
+            # ----------------------------------------------------
+            # (3) First train with small set of labeled samples
+            # ----------------------------------------------------
+            self.logger.info("(3) First train with small set of labeled samples")
+    
+            train_path = labeled_img_dir_train.relative_to(work_dir)
+            val_path = labeled_img_dir_val.relative_to(work_dir)
+    
+            labeled_yaml = work_dir / "labeled.yaml"
+            labeled_yaml.write_text(
+                f"""
+                train: {train_path.as_posix()}
+                val: {val_path.as_posix()}
+    
+                nc: {self.nc}
+                names: {self.class_names}
+                """
+            )
+    
+            trainer1 = YOLOTrainer(
+                model_weights=self.model_weights,
+                data_yaml=str(labeled_yaml),
+                output_dir=work_dir / "stage1"
+            )
+    
+            _ = trainer1.train(**train_kwargs, project=work_dir, name="stage1")
+            weak_weights = work_dir / "stage1/weights/best.pt"
+    
+            del trainer1
+            cuda_cleanup()
+    
+            # additional validation to extract optimal working point (maximazing F1-score)
+            best_conf = self._find_best_conf_threshold(weights=weak_weights, data_yaml=labeled_yaml, work_dir=work_dir)
+    
+            # ----------------------------------------------------
+            # (4) Pseudo labeling pool of unlabeled samples
+            # ----------------------------------------------------
+            self.logger.info("(4) Pseudo labeling pool of unlabeled samples")
+    
+            weak_yolo = WeakYoloSingleton(
+                model_path=str(weak_weights),
+                conf_thresh=best_conf,
+            )
+    
+            labeler = YOLOWeakAutoLabeler(
+                yolo=weak_yolo,
+                class_id=0,
+                conf_thresh=best_conf,
+                task=self.task.value
+            )
+    
+            pseudo_lbl_dir = work_dir / "pseudo/labels"
+            pseudo_lbl_dir.mkdir(parents=True, exist_ok=True)
+    
+            labeler.label_folder(
+                image_dir=unlabeled_img_dir_train,
+                out_label_dir=pseudo_lbl_dir,
+            )
+    
+            del labeler
+            del weak_yolo
+            WeakYoloSingleton._instance = None
+            cuda_cleanup()
+    
+            # ----------------------------------------------------
+            # (5) Mixed train with samples with labels and pseudo-labels
+            # ----------------------------------------------------
+            self.logger.info("(5) Mixed train with samples with labels and pseudo-labels")
+    
+            mixed_img_dir = work_dir / "mixed/images"
+            mixed_lbl_dir = work_dir / "mixed/labels"
+            mixed_img_dir.mkdir(parents=True, exist_ok=True)
+            mixed_lbl_dir.mkdir(parents=True, exist_ok=True)
+    
+            for img in labeled_img_dir_train.glob("*"):
+                shutil.copy(img, mixed_img_dir / img.name)
+                shutil.copy(
+                    labeled_lbl_dir_train / f"{img.stem}.txt",
+                    mixed_lbl_dir / f"{img.stem}.txt",
+                )
+    
+            for img in unlabeled_img_dir_train.glob("*"):
+                lbl = pseudo_lbl_dir / f"{img.stem}.txt"
+                if lbl.exists():
+                    shutil.copy(img, mixed_img_dir / img.name)
+                    shutil.copy(lbl, mixed_lbl_dir / lbl.name)
+    
+            mixed_path = mixed_img_dir.relative_to(work_dir)
+            val_path = labeled_img_dir_val.relative_to(work_dir)
+    
+            mixed_yaml = work_dir / "mixed.yaml"
+            mixed_yaml.write_text(
+                f"""
+                train: {mixed_path.as_posix()}
+                val: {val_path.as_posix()}
+    
+                nc: {self.nc}
+                names: {self.class_names}
+                """
+            )
+
+            trainer2 = YOLOTrainer(
+                model_weights=self.model_weights,
+                data_yaml=str(mixed_yaml),
+                output_dir=work_dir / "stage2",
+            )
+
+            _ = trainer2.train_distill(
+                distill_model=str(weak_weights),
+                dis=6.0,
+                **train_kwargs,
+                project=work_dir,
+                name="stage2",
+            )
+
+            final_weights = work_dir / "stage2/weights/best.pt"
+
+            del trainer2
+            cuda_cleanup()
+    
+            # ----------------------------------------------------
+            # (6) Final evaluation using test set
+            # ----------------------------------------------------
+            self.logger.info("(6) Final evaluation using test set")
+    
+            evaluator = YOLOEvaluator(
+                weights_path=str(final_weights),
+                data_yaml=str(self.data_yaml),
+                output_dir=work_dir / "eval_test",
+            )
+    
+            test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
+    
+            del evaluator
+            cuda_cleanup()
+    
+            return test_results.results_dict, work_dir
+    
+    def _run_unbiased_teacher(
+            self,
+            target_objects_train: int,
+            target_objects_val: int,
+            train_kwargs: Dict,
+            test_kwargs: Dict,
+            repeat_idx: int = 0
+        ):
+            self.logger.info("WEAK YOLO PSEUDO-LABELING")
+    
+            work_dir = self.output_root / "weak_yolo" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
+            work_dir.mkdir(parents=True, exist_ok=True)
+    
+            # ----------------------------------------------------
+            # (1) Prepare sets of labeled and unlabeled samples for training
+            # ----------------------------------------------------
+            self.logger.info("(1) Prepare sets of labeled and unlabeled samples for training")
+    
+            labeled_img_dir_train = work_dir / "labeled/images"
+            labeled_lbl_dir_train = work_dir / "labeled/labels"
+            unlabeled_img_dir_train = work_dir / "unlabeled/images"
+    
+            train_imgs = sorted(self.dataset.images("train").glob("*.*"))
+    
+            stats_train = prepare_labeled_unlabeled_with_object_budget(
+                images=train_imgs,
+                labels_dir=self.dataset.labels("train"),
+                labeled_img_dir=labeled_img_dir_train,
+                labeled_lbl_dir=labeled_lbl_dir_train,
+                unlabeled_img_dir=unlabeled_img_dir_train,
+                target_objects=target_objects_train,
+                rng=self.rng,
+                mask_mode="mean",
+                task=self.task.value
+            )
+            print(stats_train)
+    
+            # ----------------------------------------------------
+            # (2) Prepare set of labeled samples for validation
+            # ----------------------------------------------------
+            self.logger.info("(2) Prepare set of labeled samples for validation")
+    
+            labeled_img_dir_val = work_dir / "val/images"
+            labeled_lbl_dir_val = work_dir / "val/labels"
+            unlabeled_img_val = work_dir / "_tmp_ignore"
+    
+            val_imgs = sorted(self.dataset.images("val").glob("*.*"))
+    
+            stats_val = prepare_labeled_unlabeled_with_object_budget(
+                images=val_imgs,
+                labels_dir=self.dataset.labels("val"),
+                labeled_img_dir=labeled_img_dir_val,
+                labeled_lbl_dir=labeled_lbl_dir_val,
+                unlabeled_img_dir=unlabeled_img_val,
+                target_objects=target_objects_val,
+                rng=self.rng,
+                mask_mode="mean",
+                task=self.task.value
+            )
+            print(stats_val)
+    
+            # ----------------------------------------------------
+            # (3) First train with small set of labeled samples
+            # ----------------------------------------------------
+            self.logger.info("(3) First train with small set of labeled samples")
+    
+            train_path = labeled_img_dir_train.relative_to(work_dir)
+            val_path = labeled_img_dir_val.relative_to(work_dir)
+    
+            labeled_yaml = work_dir / "labeled.yaml"
+            labeled_yaml.write_text(
+                f"""
+                train: {train_path.as_posix()}
+                val: {val_path.as_posix()}
+    
+                nc: {self.nc}
+                names: {self.class_names}
+                """
+            )
+    
+            trainer1 = YOLOTrainer(
+                model_weights=self.model_weights,
+                data_yaml=str(labeled_yaml),
+                output_dir=work_dir / "stage1"
+            )
+    
+            _ = trainer1.train(**train_kwargs, project=work_dir, name="stage1")
+            weak_weights = work_dir / "stage1/weights/best.pt"
+    
+            del trainer1
+            cuda_cleanup()
+    
+            # additional validation to extract optimal working point (maximazing F1-score)
+            best_conf = self._find_best_conf_threshold(weights=weak_weights, data_yaml=labeled_yaml, work_dir=work_dir)
+    
+            # ----------------------------------------------------
+            # (4) Pseudo labeling pool of unlabeled samples
+            # ----------------------------------------------------
+            self.logger.info("(4) Pseudo labeling pool of unlabeled samples")
+    
+            weak_yolo = WeakYoloSingleton(
+                model_path=str(weak_weights),
+                conf_thresh=best_conf,
+            )
+    
+            labeler = YOLOWeakAutoLabeler(
+                yolo=weak_yolo,
+                class_id=0,
+                conf_thresh=best_conf,
+                task=self.task.value
+            )
+    
+            pseudo_lbl_dir = work_dir / "pseudo/labels"
+            pseudo_lbl_dir.mkdir(parents=True, exist_ok=True)
+    
+            labeler.label_folder(
+                image_dir=unlabeled_img_dir_train,
+                out_label_dir=pseudo_lbl_dir,
+            )
+    
+            del labeler
+            del weak_yolo
+            WeakYoloSingleton._instance = None
+            cuda_cleanup()
+    
+            # ----------------------------------------------------
+            # (5) Mixed train with samples with labels and pseudo-labels
+            # ----------------------------------------------------
+            self.logger.info("(5) Mixed train with samples with labels and pseudo-labels")
+    
+            mixed_img_dir = work_dir / "mixed/images"
+            mixed_lbl_dir = work_dir / "mixed/labels"
+            mixed_img_dir.mkdir(parents=True, exist_ok=True)
+            mixed_lbl_dir.mkdir(parents=True, exist_ok=True)
+    
+            for img in labeled_img_dir_train.glob("*"):
+                shutil.copy(img, mixed_img_dir / img.name)
+                shutil.copy(
+                    labeled_lbl_dir_train / f"{img.stem}.txt",
+                    mixed_lbl_dir / f"{img.stem}.txt",
+                )
+    
+            for img in unlabeled_img_dir_train.glob("*"):
+                lbl = pseudo_lbl_dir / f"{img.stem}.txt"
+                if lbl.exists():
+                    shutil.copy(img, mixed_img_dir / img.name)
+                    shutil.copy(lbl, mixed_lbl_dir / lbl.name)
+    
+            mixed_path = mixed_img_dir.relative_to(work_dir)
+            val_path = labeled_img_dir_val.relative_to(work_dir)
+    
+            mixed_yaml = work_dir / "mixed.yaml"
+            mixed_yaml.write_text(
+                f"""
+                train: {mixed_path.as_posix()}
+                val: {val_path.as_posix()}
+    
+                nc: {self.nc}
+                names: {self.class_names}
+                """
+            )
+
+            trainer2 = UnbiasedTeacherV2Trainer(
+                model_weights=self.model_weights,
+                output_dir=work_dir / "stage2",
+                config=None,
+            )
+
+            # Use folder-based adapter to build simple dataloaders from the
+            # mixed image/label folders and unlabeled images.
+            _ = trainer2.train_from_dirs(
+                labeled_images_dir=mixed_img_dir,
+                labeled_labels_dir=mixed_lbl_dir,
+                unlabeled_images_dir=unlabeled_img_dir_train,
+                epochs=train_kwargs.get("epochs", None),
+                batch_size=train_kwargs.get("batch", None),
+                img_size=train_kwargs.get("imgsz", None),
+                num_workers=train_kwargs.get("workers", 0),
+            )
+            final_weights = work_dir / "stage2/weights/best.pt"
+    
+            del trainer2
+            cuda_cleanup()
+    
+            # ----------------------------------------------------
+            # (6) Final evaluation using test set
+            # ----------------------------------------------------
+            self.logger.info("(6) Final evaluation using test set")
+    
+            evaluator = YOLOEvaluator(
+                weights_path=str(final_weights),
+                data_yaml=str(self.data_yaml),
+                output_dir=work_dir / "eval_test",
+            )
+    
+            test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
+    
+            del evaluator
+            cuda_cleanup()
+    
+            return test_results.results_dict, work_dir  
 
     def _run_weak_yolo_pseudo(
         self,
@@ -655,6 +1063,37 @@ if __name__ == "__main__":
                 test_kwargs=test_kwargs,
                 repeats=REPEATS
             )
+
+        """
+        # PSEUDO WEAK YOLO + KNOWLEDGE DISTILLATION        
+        weak_target_objects_train_values = [40]
+        for target_objects_train in weak_target_objects_train_values:
+            print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
+            results = exp.run(
+                mode=ExperimentMode.WEAK_YOLO_KD,
+                target_objects_train=target_objects_train,
+                target_objects_val=target_objects_train,
+                train_kwargs=train_kwargs,
+                test_kwargs=test_kwargs,
+                repeats=REPEATS
+            )
+        """
+
+        """
+        # PSEUDO WEAK YOLO + UNBIASED TEACHER
+        weak_target_objects_train_values = [40]
+        for target_objects_train in weak_target_objects_train_values:
+            print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
+            results = exp.run(
+                mode=ExperimentMode.WEAK_YOLO_UNBIASED_TEACHER,
+                target_objects_train=target_objects_train,
+                target_objects_val=target_objects_train,
+                train_kwargs=train_kwargs,
+                test_kwargs=test_kwargs,
+                repeats=REPEATS
+            )
+        """
+
 
         """
         # PSEUDO SAM
