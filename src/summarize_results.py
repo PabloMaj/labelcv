@@ -117,15 +117,27 @@ class ExperimentSummarizer:
         return g[cols].sort_values(group_cols)
 
     def plot_ap50_vs_nlabels(self, df: pd.DataFrame):
-        x = [10, 20, 40, 80]
         plt.figure()
 
-        for m in ["only_labeled", "weak_yolo", "sam"]:
-            y = (df[df.method == m].sort_values("n_labels")["AP50"])
-            plt.plot(x, y, marker="o", label=m)
+        for m in ["only_labeled", "yolo_ub", "weak_yolo_kd", "weak_yolo", "sam"]:
+            subset = df[df.method == m].copy()
+            if subset.empty:
+                continue
 
-        ap_std = df[df.method == "standard_yolo"]["AP50"].iloc[0]
-        plt.plot(x, [ap_std] * 4, marker="o", label="standard_yolo")
+            subset["n_labels_num"] = pd.to_numeric(subset["n_labels"], errors="coerce")
+            subset = subset.dropna(subset=["n_labels_num"]).sort_values("n_labels_num")
+            if subset.empty:
+                continue
+
+            plt.plot(subset["n_labels_num"], subset["AP50"], marker="o", label=m)
+
+        std = df[df.method == "standard_yolo"]
+        if not std.empty:
+            ap_std = std["AP50"].iloc[0]
+            x_min = df["n_labels"].pipe(pd.to_numeric, errors="coerce").min()
+            x_max = df["n_labels"].pipe(pd.to_numeric, errors="coerce").max()
+            if pd.notna(x_min) and pd.notna(x_max):
+                plt.plot([x_min, x_max], [ap_std, ap_std], marker="o", label="standard_yolo")
 
         plt.xlabel("n_labels")
         plt.ylabel("AP50")

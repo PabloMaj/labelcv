@@ -11,14 +11,27 @@ class YOLOTrainer:
         self.model_weights = model_weights
         self.data_yaml = data_yaml
         self.output_dir = output_dir
-        # self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.model = YOLO(f"resources/{model_weights}")
+
+        self.project_dir = self.output_dir.parent.absolute()
+        self.run_name = self.output_dir.name
+        
+        self.final_weights = self.output_dir / "weights/best.pt"
 
     def train(self, **train_kwargs):
         """
         Run training and save training history and best validation metrics.
         """
-        results = self.model.train(data=self.data_yaml, **train_kwargs)
+        train_args = {
+                        "data": self.data_yaml,
+                        **train_kwargs,
+        }
+        train_args["project"] = str(self.project_dir)
+        train_args["name"] = self.run_name
+        train_args["exist_ok"] = True  # Allow overwriting existing runs
+
+        results = self.model.train(**train_args)
 
         history_path = self.output_dir / "train_history.json"
         best_val_path = self.output_dir / "best_val_metrics.json"
@@ -52,6 +65,9 @@ class YOLOTrainer:
                 "data": self.data_yaml,
                 **train_kwargs,
         }
+        train_args["project"] = str(self.project_dir)
+        train_args["name"] = self.run_name
+        train_args["exist_ok"] = True  # Allow overwriting existing runs
     
         if distill_model is not None:
             train_args["distill_model"] = distill_model
@@ -90,14 +106,25 @@ class YOLOEvaluator:
         self.weights_path = weights_path
         self.data_yaml = data_yaml
         self.output_dir = output_dir
-        # self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.model = YOLO(weights_path)
+
+        self.project_dir = self.output_dir.parent.absolute()
+        self.run_name = self.output_dir.name
 
     def test(self, **test_kwargs):
         """
         Run evaluation on the test set and save metrics.
         """
-        results = self.model.val(data=self.data_yaml, split="test", **test_kwargs)
+        test_args = {
+            "data": self.data_yaml,
+            "split": "test",
+            "exist_ok": True,  # Allow overwriting existing runs
+            **test_kwargs,
+        }
+        test_args["project"] = str(self.project_dir)
+        test_args["name"] = self.run_name
+        results = self.model.val(**test_args)
 
         test_metrics_path = self.output_dir / "test_metrics.json"
         metrics = results.results_dict if hasattr(results, "results_dict") else {}

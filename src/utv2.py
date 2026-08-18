@@ -33,6 +33,7 @@ from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils.tal import make_anchors
 
+import numpy as np
 
 # ============================================================================
 # Configuration
@@ -111,6 +112,29 @@ class UTv2Detect(Detect):
         return preds
 
 
+def infer_detect_channels(head: Detect) -> tuple[int, ...]:
+    """Recover the input channels used by an existing Detect head."""
+
+    ch = getattr(head, "ch", None)
+    if ch:
+        ch_tuple = tuple(int(c) for c in ch)
+        if ch_tuple:
+            return ch_tuple
+
+    layers = getattr(head, "cv2", None)
+    if layers is not None:
+        inferred = []
+        for layer in layers:
+            first = layer[0] if isinstance(layer, nn.Sequential) else layer
+            conv = getattr(first, "conv", None)
+            if conv is not None and hasattr(conv, "in_channels"):
+                inferred.append(int(conv.in_channels))
+        if inferred:
+            return tuple(inferred)
+
+    raise ValueError("Unable to infer Detect input channels for UTv2 replacement.")
+
+
 def replace_detect_with_utv2(model: DetectionModel):
     """Replace YOLO11 Detect while retaining all original YOLO weights."""
 
@@ -123,7 +147,7 @@ def replace_detect_with_utv2(model: DetectionModel):
         nc=old.nc,
         reg_max=old.reg_max,
         end2end=getattr(old, "end2end", False),
-        ch=getattr(old, "ch", ()),
+        ch=infer_detect_channels(old),
     )
 
     old_state = old.state_dict()
@@ -134,6 +158,12 @@ def replace_detect_with_utv2(model: DetectionModel):
             new_state[key].copy_(value)
 
     new.load_state_dict(new_state, strict=False)
+
+    # Preserve the module metadata expected by Ultralytics' model forward path.
+    for attr in ("f", "i", "type", "np", "stride", "legacy", "inplace"):
+        if hasattr(old, attr):
+            setattr(new, attr, getattr(old, attr))
+
     model.model[-1] = new
 
     return model
@@ -224,7 +254,7 @@ def xyxy_to_ltrb(
 @torch.no_grad()
 def decode_predictions(
     model: DetectionModel,
-    preds: Dict[str, torch.Tensor],
+    preds: Dict[str, torch.Tensor] | tuple[torch.Tensor, Dict[str, torch.Tensor]],
 ):
     """
     Decode raw training predictions.
@@ -239,22 +269,19 @@ def decode_predictions(
 
     head = find_detect(model)
 
-    pred_distri = (
-        preds["boxes"]
-        .permute(0, 2, 1)
-        .contiguous()
-    )
+    if isinstance(preds, tuple):
+        preds = preds[1]
+
+    pred_distri = preds["boxes"].contiguous()
 
     scores = (
         preds["scores"]
-        .permute(0, 2, 1)
         .contiguous()
         .sigmoid()
     )
 
     uncertainty = (
         preds["uncertainty"]
-        .permute(0, 2, 1)
         .contiguous()
     )
 
@@ -264,12 +291,17 @@ def decode_predictions(
         0.5,
     )
 
-    boxes = head.bbox_decode(
-        anchors,
-        pred_distri,
+    decode_anchors = anchors.transpose(0, 1)
+    decode_stride = stride.transpose(0, 1)
+
+    boxes = head.decode_bboxes(
+        head.dfl(pred_distri),
+        decode_anchors.unsqueeze(0),
     )
 
-    boxes = boxes * stride
+    boxes = (boxes * decode_stride).permute(0, 2, 1).contiguous()
+    scores = scores.permute(0, 2, 1).contiguous()
+    uncertainty = uncertainty.permute(0, 2, 1).contiguous()
 
     return {
         "boxes": boxes,
@@ -425,9 +457,10 @@ class UTv2DetectionLoss(v8DetectionLoss):
                 fg_mask,
             )
 
-        loss[0] *= self.hyp.box
-        loss[1] *= self.hyp.cls
-        loss[2] *= self.hyp.dfl
+        hyp = self.hyp
+        loss[0] *= hyp.get("box", 1.0) if isinstance(hyp, dict) else hyp.box
+        loss[1] *= hyp.get("cls", 1.0) if isinstance(hyp, dict) else hyp.cls
+        loss[2] *= hyp.get("dfl", 1.0) if isinstance(hyp, dict) else hyp.dfl
         loss[3] *= self.uncertainty_weight
 
         return loss.sum() * batch_size, loss.detach()
@@ -573,7 +606,8 @@ class UnbiasedTeacherV2Trainer:
         self.cfg = config or UTv2Config()
         self.device = torch.device(device)
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)        
+        self.final_weights_path = self.output_dir / "weights" / "best.pt"
 
         random.seed(seed)
         torch.manual_seed(seed)
@@ -796,11 +830,21 @@ class UnbiasedTeacherV2Trainer:
         labeled_loader: Iterable,
         unlabeled_loader: Iterable,
         epochs: Optional[int] = None,
+        patience: Optional[int] = 10,
     ):
         epochs = epochs or self.cfg.epochs
 
         history = []
         unlabeled_iter = iter(unlabeled_loader)
+        best_loss = float("inf")
+
+        # Persist final student and teacher weights in a YOLO-like layout
+        weights_dir = self.final_weights_path.parent
+        weights_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save training history and best metrics similar to YOLOTrainer.
+        history_path = self.output_dir / "train_history.json"
+        best_val_path = self.output_dir / "best_val_metrics.json"
 
         for epoch in range(epochs):
             self.student.train()
@@ -899,12 +943,29 @@ class UnbiasedTeacherV2Trainer:
                 f"pseudo={mean_pseudo:.1f}"
             )
 
-        # Save training history and best metrics similar to YOLOTrainer.
-        history_path = self.output_dir / "train_history.json"
-        best_val_path = self.output_dir / "best_val_metrics.json"
+            if mean_loss < best_loss:
+                best_loss = mean_loss
+                self.save_weights(self.final_weights_path)
 
-        with open(history_path, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+            with open(history_path, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+
+            self.save_weights(self.final_weights_path.parent / "last.pt")
+
+            # Patience-based early stopping
+            if patience is not None:
+                if len(history) > patience:
+                    recent_losses = [h["loss"] for h in history[-patience:]]
+                    # No change in metric
+                    EPS = 1e-4
+                    mean = np.mean(recent_losses)
+                    std = np.std(recent_losses)
+                    is_stagnant = std < EPS and abs(mean - best_loss) < EPS
+                    # Loss near zero
+                    is_near_zero = mean < EPS
+                    if is_stagnant or is_near_zero:
+                        print(f"[UTv2] Early stopping after {epoch + 1} epochs.")
+                        break
 
         best_metrics = {}
         if len(history) > 0:
@@ -914,35 +975,23 @@ class UnbiasedTeacherV2Trainer:
         with open(best_val_path, "w", encoding="utf-8") as f:
             json.dump(best_metrics, f, indent=2)
 
-        # Persist final student and teacher weights in a YOLO-like layout
-        weights_dir = self.output_dir / "weights"
-        weights_dir.mkdir(parents=True, exist_ok=True)
-        weights_path = weights_dir / "best.pt"
-
-        try:
-            self.save_weights(weights_path)
-        except Exception:
-            # Do not fail training if saving fails; log via print for now.
-            print(f"Warning: failed to save weights to {weights_path}")
-
         return history
 
     def save_weights(self, path: str | Path):
-        """Save the student and teacher state_dicts to `path`.
+        """Save the student to `path` using Ultralytics checkpoint format.
 
         Args:
             path: file path to write (e.g. '.../weights/best.pt').
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-
-        torch.save(
-            {
-                "model": self.student.state_dict(),
-                "teacher": self.teacher.state_dict(),
-            },
-            str(path),
-        )
+        
+        ckpt = {
+            "model": self.student.half() if hasattr(self.student, "half") else self.student,
+            "train_args": vars(self.args) if hasattr(self, "args") else {},
+        }
+        
+        torch.save(ckpt, path)
 
     # ------------------------------------------------------------------
     # Convenience adapter: build simple datasets from folders and train

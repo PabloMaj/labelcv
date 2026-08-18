@@ -164,6 +164,8 @@ class VisionTaskExperiment:
             else:
                 raise ValueError(f"Unsupported mode: {mode}")
 
+            if result is None or work_dir is None: continue
+
             metadata = dict(
                 mode=mode.value,
                 repeat_idx=i,
@@ -189,6 +191,11 @@ class VisionTaskExperiment:
 
         work_dir.mkdir(parents=True, exist_ok=True)
 
+        check_path = work_dir / "eval_test"
+        if check_path.exists():
+            self.logger.info(f"Experiment {check_path} already exists!")
+            return None, None
+
         # ----------------------------------------------------
         # (1) Training model on whole dataset (train + val)
         # ----------------------------------------------------
@@ -200,8 +207,8 @@ class VisionTaskExperiment:
             output_dir=work_dir / "train"
         )
 
-        _ = trainer.train(**train_kwargs, project=work_dir, name="train")
-        final_weights = work_dir / "train/weights/best.pt"
+        _ = trainer.train(**train_kwargs)
+        final_weights = trainer.final_weights
 
         del trainer
         cuda_cleanup()
@@ -217,7 +224,7 @@ class VisionTaskExperiment:
             output_dir=work_dir / "eval_test",
         )
 
-        test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
+        test_results = evaluator.test(**test_kwargs)       
 
         del evaluator
         cuda_cleanup()
@@ -234,8 +241,13 @@ class VisionTaskExperiment:
         ):
             self.logger.info("KNOWLEDGE DISTILLATION")
     
-            work_dir = self.output_root / "weak_yolo" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
+            work_dir = self.output_root / "weak_yolo_kd" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
             work_dir.mkdir(parents=True, exist_ok=True)
+
+            check_path = work_dir / "eval_test"
+            if check_path.exists():
+                self.logger.info(f"Experiment {check_path} already exists!")
+                return None, None
     
             # ----------------------------------------------------
             # (1) Prepare sets of labeled and unlabeled samples for training
@@ -310,7 +322,7 @@ class VisionTaskExperiment:
                 output_dir=work_dir / "stage1"
             )
     
-            _ = trainer1.train(**train_kwargs, project=work_dir, name="stage1")
+            _ = trainer1.train(**train_kwargs)
             weak_weights = work_dir / "stage1/weights/best.pt"
     
             del trainer1
@@ -396,11 +408,9 @@ class VisionTaskExperiment:
                 distill_model=str(weak_weights),
                 dis=6.0,
                 **train_kwargs,
-                project=work_dir,
-                name="stage2",
             )
 
-            final_weights = work_dir / "stage2/weights/best.pt"
+            final_weights = trainer2.final_weights
 
             del trainer2
             cuda_cleanup()
@@ -416,7 +426,18 @@ class VisionTaskExperiment:
                 output_dir=work_dir / "eval_test",
             )
     
-            test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
+            test_results = evaluator.test(**test_kwargs)
+
+            # ----------------------------------------------------
+            # (7) Cleanup temporary folders
+            # ----------------------------------------------------
+            self.logger.info("(6) Cleanup temporary folders")
+            shutil.rmtree(work_dir / "unlabeled")
+            shutil.rmtree(work_dir / "labeled")
+            shutil.rmtree(work_dir / "mixed")
+            shutil.rmtree(work_dir / "pseudo")
+            shutil.rmtree(work_dir / "val")
+            shutil.rmtree(work_dir / "_tmp_ignore")
     
             del evaluator
             cuda_cleanup()
@@ -433,8 +454,13 @@ class VisionTaskExperiment:
         ):
             self.logger.info("WEAK YOLO PSEUDO-LABELING")
     
-            work_dir = self.output_root / "weak_yolo" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
+            work_dir = self.output_root / "yolo_ub" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
             work_dir.mkdir(parents=True, exist_ok=True)
+
+            check_path = work_dir / "eval_test"
+            if check_path.exists():
+                self.logger.info(f"Experiment {check_path} already exists!")
+                return None, None
     
             # ----------------------------------------------------
             # (1) Prepare sets of labeled and unlabeled samples for training
@@ -509,7 +535,7 @@ class VisionTaskExperiment:
                 output_dir=work_dir / "stage1"
             )
     
-            _ = trainer1.train(**train_kwargs, project=work_dir, name="stage1")
+            _ = trainer1.train(**train_kwargs)
             weak_weights = work_dir / "stage1/weights/best.pt"
     
             del trainer1
@@ -602,7 +628,7 @@ class VisionTaskExperiment:
                 img_size=train_kwargs.get("imgsz", None),
                 num_workers=train_kwargs.get("workers", 0),
             )
-            final_weights = work_dir / "stage2/weights/best.pt"
+            final_weights = trainer2.final_weights_path
     
             del trainer2
             cuda_cleanup()
@@ -618,7 +644,18 @@ class VisionTaskExperiment:
                 output_dir=work_dir / "eval_test",
             )
     
-            test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
+            test_results = evaluator.test(**test_kwargs)
+
+            # ----------------------------------------------------
+            # (7) Cleanup temporary folders
+            # ----------------------------------------------------
+            self.logger.info("(7) Cleanup temporary folders")
+            shutil.rmtree(work_dir / "unlabeled", ignore_errors=True)
+            shutil.rmtree(work_dir / "labeled", ignore_errors=True)
+            shutil.rmtree(work_dir / "mixed", ignore_errors=True)
+            shutil.rmtree(work_dir / "pseudo", ignore_errors=True)
+            shutil.rmtree(work_dir / "val", ignore_errors=True)
+            shutil.rmtree(work_dir / "_tmp_ignore", ignore_errors=True)
     
             del evaluator
             cuda_cleanup()
@@ -637,6 +674,11 @@ class VisionTaskExperiment:
 
         work_dir = self.output_root / "weak_yolo" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
         work_dir.mkdir(parents=True, exist_ok=True)
+
+        check_path = work_dir / "eval_test"
+        if check_path.exists():
+            self.logger.info(f"Experiment {check_path} already exists!")
+            return None, None
 
         # ----------------------------------------------------
         # (1) Prepare sets of labeled and unlabeled samples for training
@@ -711,7 +753,7 @@ class VisionTaskExperiment:
             output_dir=work_dir / "stage1"
         )
 
-        _ = trainer1.train(**train_kwargs, project=work_dir, name="stage1")
+        _ = trainer1.train(**train_kwargs)
         weak_weights = work_dir / "stage1/weights/best.pt"
 
         del trainer1
@@ -793,8 +835,8 @@ class VisionTaskExperiment:
             output_dir=work_dir / "stage2"
         )
 
-        _ = trainer2.train(**train_kwargs, project=work_dir, name="stage2")
-        final_weights = work_dir / "stage2/weights/best.pt"
+        _ = trainer2.train(**train_kwargs)
+        final_weights = trainer2.final_weights
 
         del trainer2
         cuda_cleanup()
@@ -810,7 +852,18 @@ class VisionTaskExperiment:
             output_dir=work_dir / "eval_test",
         )
 
-        test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
+        test_results = evaluator.test(**test_kwargs)
+
+        # ----------------------------------------------------
+        # (7) Cleanup temporary folders
+        # ----------------------------------------------------
+        self.logger.info("(7) Cleanup temporary folders")
+        shutil.rmtree(work_dir / "unlabeled", ignore_errors=True)
+        shutil.rmtree(work_dir / "labeled", ignore_errors=True)
+        shutil.rmtree(work_dir / "mixed", ignore_errors=True)
+        shutil.rmtree(work_dir / "pseudo", ignore_errors=True)
+        shutil.rmtree(work_dir / "val", ignore_errors=True)
+        shutil.rmtree(work_dir / "_tmp_ignore", ignore_errors=True)
 
         del evaluator
         cuda_cleanup()
@@ -832,6 +885,11 @@ class VisionTaskExperiment:
 
         work_dir = self.output_root / "sam" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
         work_dir.mkdir(parents=True, exist_ok=True)
+
+        check_path = work_dir / "eval_test"
+        if check_path.exists():
+            self.logger.info(f"Experiment {check_path} already exists!")
+            return None, None
 
         # ----------------------------------------------------
         # (1) Prepare sets of labeled and unlabeled samples for training
@@ -983,8 +1041,8 @@ class VisionTaskExperiment:
             output_dir=work_dir / "yolo_train"
         )
 
-        _ = trainer.train(**train_kwargs, project=work_dir, name="yolo_train")
-        final_weights = work_dir / "yolo_train/weights/best.pt"
+        _ = trainer.train(**train_kwargs)
+        final_weights = trainer.final_weights
 
         del trainer
         cuda_cleanup()
@@ -1000,7 +1058,7 @@ class VisionTaskExperiment:
             output_dir=work_dir / "eval_test",
         )
 
-        test_results = evaluator.test(**test_kwargs, project=work_dir, name="eval_test")
+        test_results = evaluator.test(**test_kwargs)
 
         del evaluator
         cuda_cleanup()
