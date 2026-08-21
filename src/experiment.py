@@ -1,3 +1,6 @@
+import os
+os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR" # Ignore OOM warning in PyTorch (BUG)
+
 import random
 import shutil
 import yaml
@@ -8,7 +11,6 @@ import gc
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
-from typing import Dict
 from ultralytics import YOLO
 
 from src.dataset_layout import DatasetLayout
@@ -31,6 +33,8 @@ def cuda_cleanup():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
+SUBDIRS_SHARED_STAGE1 = ["weak_yolo", "weak_yolo_kd", "weak_yolo_ub"] # Order is important - first WEAK YOLO (PPL+YOLO)
+SUBDIRS_REMOVE_AFTER_EVAL = ["unlabeled", "labeled", "mixed", "pseudo", "val", "_tmp_ignore"]
 
 class ExperimentMode(Enum):
     STANDARD = "standard"
@@ -38,7 +42,6 @@ class ExperimentMode(Enum):
     SAM3_PSEUDO = "sam3_pseudo"
     WEAK_YOLO_KD = "weak_yolo_kd"
     WEAK_YOLO_UNBIASED_TEACHER = "weak_yolo_unbiased_teacher"
-
 
 class VisionTaskExperiment:
     def __init__(
@@ -174,7 +177,7 @@ class VisionTaskExperiment:
                 results=result
             )
             fields = ["target_objects_train", "target_objects_val", "llm_model", "max_iters_prompt_optimizer",
-                      "max_desc_words", "train_kwargs", "test_kwargs"]
+                      "max_desc_words", "train_kwargs_weak", "train_kwargs_normal", "test_kwargs"]
             for f in fields:
                 if f in kwargs:
                     metadata[f] = kwargs[f],
@@ -183,8 +186,8 @@ class VisionTaskExperiment:
             all_results.append(result)
 
         return all_results
-
-    def _run_standard(self, train_kwargs: dict, test_kwargs: dict, repeat_idx: int = 0):
+    
+    def _run_standard(self, train_kwargs_weak: dict, train_kwargs_normal: dict, test_kwargs: dict, repeat_idx: int = 0):
         self.logger.info("STANDARD: training on full dataset")
 
         work_dir = self.output_root / "standard_yolo" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
@@ -207,7 +210,7 @@ class VisionTaskExperiment:
             output_dir=work_dir / "train"
         )
 
-        _ = trainer.train(**train_kwargs)
+        _ = trainer.train(**train_kwargs_normal)
         final_weights = trainer.final_weights
 
         del trainer
@@ -235,8 +238,9 @@ class VisionTaskExperiment:
             self,
             target_objects_train: int,
             target_objects_val: int,
-            train_kwargs: Dict,
-            test_kwargs: Dict,
+            train_kwargs_weak: dict,
+            train_kwargs_normal: dict, 
+            test_kwargs: dict,
             repeat_idx: int = 0
         ):
             self.logger.info("KNOWLEDGE DISTILLATION")
@@ -316,17 +320,27 @@ class VisionTaskExperiment:
                 """
             )
     
-            trainer1 = YOLOTrainer(
-                model_weights=self.model_weights,
-                data_yaml=str(labeled_yaml),
-                output_dir=work_dir / "stage1"
-            )
-    
-            _ = trainer1.train(**train_kwargs)
-            weak_weights = work_dir / "stage1/weights/best.pt"
-    
-            del trainer1
-            cuda_cleanup()
+            # Check if weak weights exist in different experiment (weak_yolo, weak_yolo_kd or weak_yolo_ub) and reuse them if available
+            for subdir in SUBDIRS_SHARED_STAGE1:
+                tmp_dir = self.output_root / subdir / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}" / "stage1/weights/best.pt"
+                tmp_dir2 = self.output_root / subdir / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}" / "stage1/results.png"
+
+                if tmp_dir.exists() and tmp_dir2.exists():
+                    weak_weights = tmp_dir
+                    self.logger.info(f"Reusing weak weights from {tmp_dir}")
+                    break
+            else:
+                trainer1 = YOLOTrainer(
+                    model_weights=self.model_weights,
+                    data_yaml=str(labeled_yaml),
+                    output_dir=work_dir / "stage1"
+                )
+        
+                _ = trainer1.train(**train_kwargs_weak)
+                weak_weights = work_dir / "stage1/weights/best.pt"
+        
+                del trainer1
+                cuda_cleanup()
     
             # additional validation to extract optimal working point (maximazing F1-score)
             best_conf = self._find_best_conf_threshold(weights=weak_weights, data_yaml=labeled_yaml, work_dir=work_dir)
@@ -407,7 +421,7 @@ class VisionTaskExperiment:
             _ = trainer2.train_distill(
                 distill_model=str(weak_weights),
                 dis=6.0,
-                **train_kwargs,
+                **train_kwargs_normal,
             )
 
             final_weights = trainer2.final_weights
@@ -431,14 +445,12 @@ class VisionTaskExperiment:
             # ----------------------------------------------------
             # (7) Cleanup temporary folders
             # ----------------------------------------------------
-            self.logger.info("(6) Cleanup temporary folders")
-            shutil.rmtree(work_dir / "unlabeled")
-            shutil.rmtree(work_dir / "labeled")
-            shutil.rmtree(work_dir / "mixed")
-            shutil.rmtree(work_dir / "pseudo")
-            shutil.rmtree(work_dir / "val")
-            shutil.rmtree(work_dir / "_tmp_ignore")
-    
+            self.logger.info("(7) Cleanup temporary folders")
+            for subdir in SUBDIRS_REMOVE_AFTER_EVAL:
+                dir_path = work_dir / subdir
+                if dir_path.exists():
+                    shutil.rmtree(dir_path)
+
             del evaluator
             cuda_cleanup()
     
@@ -448,13 +460,14 @@ class VisionTaskExperiment:
             self,
             target_objects_train: int,
             target_objects_val: int,
-            train_kwargs: Dict,
-            test_kwargs: Dict,
+            train_kwargs_weak: dict,
+            train_kwargs_normal: dict, 
+            test_kwargs: dict,
             repeat_idx: int = 0
         ):
             self.logger.info("WEAK YOLO PSEUDO-LABELING")
     
-            work_dir = self.output_root / "yolo_ub" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
+            work_dir = self.output_root / "weak_yolo_ub" / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}"
             work_dir.mkdir(parents=True, exist_ok=True)
 
             check_path = work_dir / "eval_test"
@@ -528,18 +541,28 @@ class VisionTaskExperiment:
                 names: {self.class_names}
                 """
             )
-    
-            trainer1 = YOLOTrainer(
-                model_weights=self.model_weights,
-                data_yaml=str(labeled_yaml),
-                output_dir=work_dir / "stage1"
-            )
-    
-            _ = trainer1.train(**train_kwargs)
-            weak_weights = work_dir / "stage1/weights/best.pt"
-    
-            del trainer1
-            cuda_cleanup()
+
+            # Check if weak weights exist in different experiment (weak_yolo, weak_yolo_kd or weak_yolo_ub) and reuse them if available
+            for subdir in SUBDIRS_SHARED_STAGE1:
+                tmp_dir = self.output_root / subdir / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}" / "stage1/weights/best.pt"
+                tmp_dir2 = self.output_root / subdir / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}" / "stage1/results.png"
+            
+                if tmp_dir.exists() and tmp_dir2.exists():
+                    weak_weights = tmp_dir
+                    self.logger.info(f"Reusing weak weights from {tmp_dir}")
+                    break
+            else:
+                trainer1 = YOLOTrainer(
+                    model_weights=self.model_weights,
+                    data_yaml=str(labeled_yaml),
+                    output_dir=work_dir / "stage1"
+                )
+        
+                _ = trainer1.train(**train_kwargs_weak)
+                weak_weights = work_dir / "stage1/weights/best.pt"
+        
+                del trainer1
+                cuda_cleanup()
     
             # additional validation to extract optimal working point (maximazing F1-score)
             best_conf = self._find_best_conf_threshold(weights=weak_weights, data_yaml=labeled_yaml, work_dir=work_dir)
@@ -623,10 +646,10 @@ class VisionTaskExperiment:
                 labeled_images_dir=mixed_img_dir,
                 labeled_labels_dir=mixed_lbl_dir,
                 unlabeled_images_dir=unlabeled_img_dir_train,
-                epochs=train_kwargs.get("epochs", None),
-                batch_size=train_kwargs.get("batch", None),
-                img_size=train_kwargs.get("imgsz", None),
-                num_workers=train_kwargs.get("workers", 0),
+                epochs=train_kwargs_normal.get("epochs", None),
+                batch_size=train_kwargs_normal.get("batch", None),
+                img_size=train_kwargs_normal.get("imgsz", None),
+                num_workers=train_kwargs_normal.get("workers", 0),
             )
             final_weights = trainer2.final_weights_path
     
@@ -650,12 +673,10 @@ class VisionTaskExperiment:
             # (7) Cleanup temporary folders
             # ----------------------------------------------------
             self.logger.info("(7) Cleanup temporary folders")
-            shutil.rmtree(work_dir / "unlabeled", ignore_errors=True)
-            shutil.rmtree(work_dir / "labeled", ignore_errors=True)
-            shutil.rmtree(work_dir / "mixed", ignore_errors=True)
-            shutil.rmtree(work_dir / "pseudo", ignore_errors=True)
-            shutil.rmtree(work_dir / "val", ignore_errors=True)
-            shutil.rmtree(work_dir / "_tmp_ignore", ignore_errors=True)
+            for subdir in SUBDIRS_REMOVE_AFTER_EVAL:
+                dir_path = work_dir / subdir
+                if dir_path.exists():
+                    shutil.rmtree(dir_path)
     
             del evaluator
             cuda_cleanup()
@@ -666,8 +687,9 @@ class VisionTaskExperiment:
         self,
         target_objects_train: int,
         target_objects_val: int,
-        train_kwargs: Dict,
-        test_kwargs: Dict,
+        train_kwargs_weak: dict,
+        train_kwargs_normal: dict, 
+        test_kwargs: dict,
         repeat_idx: int = 0
     ):
         self.logger.info("WEAK YOLO PSEUDO-LABELING")
@@ -747,17 +769,27 @@ class VisionTaskExperiment:
             """
         )
 
-        trainer1 = YOLOTrainer(
-            model_weights=self.model_weights,
-            data_yaml=str(labeled_yaml),
-            output_dir=work_dir / "stage1"
-        )
+        # Check if weak weights exist in different experiment (weak_yolo, weak_yolo_kd or weak_yolo_ub) and reuse them if available
+        for subdir in SUBDIRS_SHARED_STAGE1:
+            tmp_dir = self.output_root / subdir / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}" / "stage1/weights/best.pt"
+            tmp_dir2 = self.output_root / subdir / f"obj_{target_objects_train}" / f"repeat_{repeat_idx}_seed_{self.random_state + repeat_idx}" / "stage1/results.png"
+        
+            if tmp_dir.exists() and tmp_dir2.exists():
+                weak_weights = tmp_dir
+                self.logger.info(f"Reusing weak weights from {tmp_dir}")
+                break
+        else:
+            trainer1 = YOLOTrainer(
+                model_weights=self.model_weights,
+                data_yaml=str(labeled_yaml),
+                output_dir=work_dir / "stage1"
+            )
 
-        _ = trainer1.train(**train_kwargs)
-        weak_weights = work_dir / "stage1/weights/best.pt"
+            _ = trainer1.train(**train_kwargs_weak)
+            weak_weights = work_dir / "stage1/weights/best.pt"
 
-        del trainer1
-        cuda_cleanup()
+            del trainer1
+            cuda_cleanup()
 
         # additional validation to extract optimal working point (maximazing F1-score)
         best_conf = self._find_best_conf_threshold(weights=weak_weights, data_yaml=labeled_yaml, work_dir=work_dir)
@@ -835,7 +867,7 @@ class VisionTaskExperiment:
             output_dir=work_dir / "stage2"
         )
 
-        _ = trainer2.train(**train_kwargs)
+        _ = trainer2.train(**train_kwargs_normal)
         final_weights = trainer2.final_weights
 
         del trainer2
@@ -858,12 +890,10 @@ class VisionTaskExperiment:
         # (7) Cleanup temporary folders
         # ----------------------------------------------------
         self.logger.info("(7) Cleanup temporary folders")
-        shutil.rmtree(work_dir / "unlabeled", ignore_errors=True)
-        shutil.rmtree(work_dir / "labeled", ignore_errors=True)
-        shutil.rmtree(work_dir / "mixed", ignore_errors=True)
-        shutil.rmtree(work_dir / "pseudo", ignore_errors=True)
-        shutil.rmtree(work_dir / "val", ignore_errors=True)
-        shutil.rmtree(work_dir / "_tmp_ignore", ignore_errors=True)
+        for subdir in SUBDIRS_REMOVE_AFTER_EVAL:
+            dir_path = work_dir / subdir
+            if dir_path.exists():
+                shutil.rmtree(dir_path)
 
         del evaluator
         cuda_cleanup()
@@ -874,8 +904,9 @@ class VisionTaskExperiment:
         self,
         target_objects_train: int,
         target_objects_val: int,
-        train_kwargs: Dict,
-        test_kwargs: Dict,
+        train_kwargs_weak: dict,
+        train_kwargs_normal: dict, 
+        test_kwargs: dict,
         llm_model: str,
         max_iters_prompt_optimizer: int,
         max_desc_words: int,
@@ -1041,7 +1072,7 @@ class VisionTaskExperiment:
             output_dir=work_dir / "yolo_train"
         )
 
-        _ = trainer.train(**train_kwargs)
+        _ = trainer.train(**train_kwargs_normal)
         final_weights = trainer.final_weights
 
         del trainer
@@ -1064,109 +1095,3 @@ class VisionTaskExperiment:
         cuda_cleanup()
 
         return test_results.results_dict, work_dir
-
-
-if __name__ == "__main__":
-
-    REPEATS = 3
-    DATASET_NAMES = ["bee_subset_1", "african-wildlife_buffalo", "african-wildlife_elephant", "african-wildlife_rhino",
-                     "african-wildlife_zebra", "construction-ppe_gloves", "construction-ppe_goggles", "construction-ppe_helmet",
-                     "construction-ppe_vest", "crack-seg", "wheat_arvalis_1", "wheat_arvalis_3", "wheat_ethz_1", "wheat_rres_1",
-                     "homeobjects_chair", "homeobjects_table", "homeobjects_potted_plant", "homeobjects_lamp"]
-    print(f"No of datasets: {len(DATASET_NAMES)}")
-
-    train_kwargs = dict(
-        epochs=200,
-        imgsz=640,
-        batch=16,
-        patience=20
-    )
-
-    test_kwargs = dict(
-        imgsz=640,
-    )
-
-    for dataset_name in DATASET_NAMES:
-
-        output_root = Path(f"runs/{dataset_name}")
-        data_yaml = f"data/datasets/{dataset_name}/data.yaml"
-
-        exp = VisionTaskExperiment(
-            dataset_root=Path(f"data/datasets/{dataset_name}"),
-            data_yaml=data_yaml,
-            model_name="yolo11n",
-            output_root=output_root,
-            random_state=42
-        )
-
-        """
-        # STANDARD
-        results = exp.run(
-            mode=ExperimentMode.STANDARD,
-            train_kwargs=train_kwargs,
-            test_kwargs=test_kwargs,
-            repeats=REPEATS
-        )
-        """
-
-        # PSEUDO WEAK YOLO
-        weak_target_objects_train_values = [40]
-        for target_objects_train in weak_target_objects_train_values:
-            print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
-            results = exp.run(
-                mode=ExperimentMode.WEAK_YOLO_PSEUDO,
-                target_objects_train=target_objects_train,
-                target_objects_val=target_objects_train,
-                train_kwargs=train_kwargs,
-                test_kwargs=test_kwargs,
-                repeats=REPEATS
-            )
-
-        """
-        # PSEUDO WEAK YOLO + KNOWLEDGE DISTILLATION        
-        weak_target_objects_train_values = [40]
-        for target_objects_train in weak_target_objects_train_values:
-            print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
-            results = exp.run(
-                mode=ExperimentMode.WEAK_YOLO_KD,
-                target_objects_train=target_objects_train,
-                target_objects_val=target_objects_train,
-                train_kwargs=train_kwargs,
-                test_kwargs=test_kwargs,
-                repeats=REPEATS
-            )
-        """
-
-        """
-        # PSEUDO WEAK YOLO + UNBIASED TEACHER
-        weak_target_objects_train_values = [40]
-        for target_objects_train in weak_target_objects_train_values:
-            print(f"\n=== WEAK YOLO | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
-            results = exp.run(
-                mode=ExperimentMode.WEAK_YOLO_UNBIASED_TEACHER,
-                target_objects_train=target_objects_train,
-                target_objects_val=target_objects_train,
-                train_kwargs=train_kwargs,
-                test_kwargs=test_kwargs,
-                repeats=REPEATS
-            )
-        """
-
-
-        """
-        # PSEUDO SAM
-        sam_target_objects_train_values = [20]
-        for target_objects_train in sam_target_objects_train_values:
-            print(f"\n=== SAM | target_objects_train={target_objects_train} | repeats={REPEATS} ===")
-            results = exp.run(
-                mode=ExperimentMode.SAM3_PSEUDO,
-                target_objects_train=target_objects_train,
-                target_objects_val=target_objects_train,
-                train_kwargs=train_kwargs,
-                test_kwargs=test_kwargs,
-                repeats=REPEATS,
-                llm_model="ministral-3:latest",
-                max_iters_prompt_optimizer=50,
-                max_desc_words=5
-            )
-        """

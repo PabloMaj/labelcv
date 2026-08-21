@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 
 class ExperimentSummarizer:
     def __init__(self, root_dir: str):
-        self.root_dir = Path(root_dir)
+        self.root_dir = Path(root_dir).resolve()
 
     @staticmethod
     def compute_f1(p, r):
@@ -77,7 +77,7 @@ class ExperimentSummarizer:
         return pd.DataFrame(rows)
 
     @staticmethod
-    def _aggregate(df, group_cols):
+    def _aggregate(df, group_cols, with_std=False):
         g = (
             df.groupby(group_cols)
               .agg(
@@ -95,8 +95,7 @@ class ExperimentSummarizer:
             ).reset_index())
 
         for c in ["precision", "recall", "F1", "AP50", "mAP50_95"]:
-            # g[c] = g[f"{c}_mean"].map("{:.4f}".format) + " ± " + g[f"{c}_std"].map("{:.4f}".format)
-            g[c] = g[f"{c}_mean"].map("{:.4f}".format)
+            g[c] = g[f"{c}_mean"].map("{:.4f}".format) if not with_std else g[f"{c}_mean"].map("{:.4f}".format) + " ± " + g[f"{c}_std"].map("{:.4f}".format)
 
         return g
 
@@ -108,6 +107,22 @@ class ExperimentSummarizer:
         group_cols = ["method", "n_labels"] if average_over_datasets else ["dataset", "method", "n_labels"]
 
         g = self._aggregate(df, group_cols)
+
+        cols = group_cols + [
+            "precision", "recall", "F1",
+            "AP50", "mAP50_95", "n_repeats"
+        ]
+
+        return g[cols].sort_values(group_cols)
+
+    def summarize_per_run(self):
+        df = self._collect()
+        if df.empty:
+            raise ValueError("Brak wyników.")
+
+        group_cols = ["dataset", "method", "n_labels"]
+
+        g = self._aggregate(df, group_cols, with_std=True)
 
         cols = group_cols + [
             "precision", "recall", "F1",
@@ -148,17 +163,22 @@ class ExperimentSummarizer:
 
 
 if __name__ == "__main__":
-    ROOT_DIR = "../runs/"
-    OUTPUT_CSV = "results_summary.csv"
+    ROOT_DIR = "runs/"
+    OUTPUT_CSV1 = "results_summary.csv"
+    OUTPUT_CSV2 = "results_summary_per_run.csv"
     AVERAGE_OVER_DATASETS = True
 
     summarizer = ExperimentSummarizer(ROOT_DIR)
     df = summarizer.summarize(average_over_datasets=AVERAGE_OVER_DATASETS)
+    df2 = summarizer.summarize_per_run()
 
     print(df.to_string(index=False))
+    print(df2.to_string(index=False))
 
-    if OUTPUT_CSV is not None:
-        df.to_csv(OUTPUT_CSV, index=False)
+    if OUTPUT_CSV1 is not None:
+        df.to_csv(OUTPUT_CSV1, index=False)
+    if OUTPUT_CSV2 is not None:
+        df2.to_csv(OUTPUT_CSV2, index=False)
 
     df["AP50"] = df["AP50"].astype("float16")
     summarizer.plot_ap50_vs_nlabels(df)

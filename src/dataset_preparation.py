@@ -5,6 +5,32 @@ from typing import List
 
 from src.label_budget import build_image_object_index, sample_by_object_budget, choose_boxes, mask_bboxes_or_polygons
 
+from pathlib import Path
+import numpy as np
+import cv2 as cv
+
+def imread(filename: str, flags: int = cv.IMREAD_COLOR) -> np.ndarray | None:
+    try:
+        file_bytes = np.fromfile(filename, dtype=np.uint8)
+        if file_bytes.size == 0:
+            return None
+
+        im = cv.imdecode(file_bytes, flags)
+        return im[..., None] if im is not None and im.ndim == 2 else im
+
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+
+def cache_image_to_disk(f: Path) -> None:
+    str_f = f.as_posix()
+    npy_path = str_f.rsplit(".", 1)[0] + ".npy"
+
+    if not Path(npy_path).exists():
+        img = imread(str_f)
+        if img is not None:
+            np.save(npy_path, img, allow_pickle=False)
+
 
 def prepare_labeled_unlabeled_with_object_budget(
     images: List[Path],
@@ -57,6 +83,12 @@ def prepare_labeled_unlabeled_with_object_budget(
     for img in images:
         if img not in used_images:
             shutil.copy(img, unlabeled_img_dir / img.name)
+            path = unlabeled_img_dir / img.name
+        else:
+            path = labeled_img_dir / img.name
+
+        # Cache the image to disk as a .npy file for faster loading during training
+        cache_image_to_disk(path)
 
     return {
         "n_labeled_images": len(used_images),

@@ -1170,8 +1170,3 @@ def save_student(
         },
         path,
     )
-
-
-if __name__ == "__main__":
-    print("UnbiasedTeacherV2 YOLO11 module.")
-    print("Use UnbiasedTeacherV2Trainer(...) from your experiment.")
