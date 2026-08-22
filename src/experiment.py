@@ -563,79 +563,15 @@ class VisionTaskExperiment:
         
                 del trainer1
                 cuda_cleanup()
-    
-            # additional validation to extract optimal working point (maximazing F1-score)
-            best_conf = self._find_best_conf_threshold(weights=weak_weights, data_yaml=labeled_yaml, work_dir=work_dir)
+
     
             # ----------------------------------------------------
-            # (4) Pseudo labeling pool of unlabeled samples
+            # (4) Training with Unbiased Teacher (UT)
             # ----------------------------------------------------
-            self.logger.info("(4) Pseudo labeling pool of unlabeled samples")
-    
-            weak_yolo = WeakYoloSingleton(
-                model_path=str(weak_weights),
-                conf_thresh=best_conf,
-            )
-    
-            labeler = YOLOWeakAutoLabeler(
-                yolo=weak_yolo,
-                class_id=0,
-                conf_thresh=best_conf,
-                task=self.task.value
-            )
-    
-            pseudo_lbl_dir = work_dir / "pseudo/labels"
-            pseudo_lbl_dir.mkdir(parents=True, exist_ok=True)
-    
-            labeler.label_folder(
-                image_dir=unlabeled_img_dir_train,
-                out_label_dir=pseudo_lbl_dir,
-            )
-    
-            del labeler
-            del weak_yolo
-            WeakYoloSingleton._instance = None
-            cuda_cleanup()
-    
-            # ----------------------------------------------------
-            # (5) Mixed train with samples with labels and pseudo-labels
-            # ----------------------------------------------------
-            self.logger.info("(5) Mixed train with samples with labels and pseudo-labels")
-    
-            mixed_img_dir = work_dir / "mixed/images"
-            mixed_lbl_dir = work_dir / "mixed/labels"
-            mixed_img_dir.mkdir(parents=True, exist_ok=True)
-            mixed_lbl_dir.mkdir(parents=True, exist_ok=True)
-    
-            for img in labeled_img_dir_train.glob("*"):
-                shutil.copy(img, mixed_img_dir / img.name)
-                shutil.copy(
-                    labeled_lbl_dir_train / f"{img.stem}.txt",
-                    mixed_lbl_dir / f"{img.stem}.txt",
-                )
-    
-            for img in unlabeled_img_dir_train.glob("*"):
-                lbl = pseudo_lbl_dir / f"{img.stem}.txt"
-                if lbl.exists():
-                    shutil.copy(img, mixed_img_dir / img.name)
-                    shutil.copy(lbl, mixed_lbl_dir / lbl.name)
-    
-            mixed_path = mixed_img_dir.relative_to(work_dir)
-            val_path = labeled_img_dir_val.relative_to(work_dir)
-    
-            mixed_yaml = work_dir / "mixed.yaml"
-            mixed_yaml.write_text(
-                f"""
-                train: {mixed_path.as_posix()}
-                val: {val_path.as_posix()}
-    
-                nc: {self.nc}
-                names: {self.class_names}
-                """
-            )
+            self.logger.info("(4) Training with Unbiased Teacher (UT)")
 
             trainer2 = UnbiasedTeacherV2Trainer(
-                model_weights=self.model_weights,
+                model_weights=weak_weights,
                 output_dir=work_dir / "stage2",
                 config=None,
             )
@@ -643,13 +579,16 @@ class VisionTaskExperiment:
             # Use folder-based adapter to build simple dataloaders from the
             # mixed image/label folders and unlabeled images.
             _ = trainer2.train_from_dirs(
-                labeled_images_dir=mixed_img_dir,
-                labeled_labels_dir=mixed_lbl_dir,
+                labeled_images_dir=labeled_img_dir_train,
+                labeled_labels_dir=labeled_lbl_dir_train,
+                labeled_images_dir_val=labeled_img_dir_val,
+                labeled_labels_dir_val=labeled_lbl_dir_val,
                 unlabeled_images_dir=unlabeled_img_dir_train,
                 epochs=train_kwargs_normal.get("epochs", None),
                 batch_size=train_kwargs_normal.get("batch", None),
                 img_size=train_kwargs_normal.get("imgsz", None),
                 num_workers=train_kwargs_normal.get("workers", 0),
+                patience=train_kwargs_normal.get("patience", 50)
             )
             final_weights = trainer2.final_weights_path
     
@@ -657,9 +596,9 @@ class VisionTaskExperiment:
             cuda_cleanup()
     
             # ----------------------------------------------------
-            # (6) Final evaluation using test set
+            # (5) Final evaluation using test set
             # ----------------------------------------------------
-            self.logger.info("(6) Final evaluation using test set")
+            self.logger.info("(5) Final evaluation using test set")
     
             evaluator = YOLOEvaluator(
                 weights_path=str(final_weights),
@@ -670,9 +609,9 @@ class VisionTaskExperiment:
             test_results = evaluator.test(**test_kwargs)
 
             # ----------------------------------------------------
-            # (7) Cleanup temporary folders
+            # (6) Cleanup temporary folders
             # ----------------------------------------------------
-            self.logger.info("(7) Cleanup temporary folders")
+            self.logger.info("(6) Cleanup temporary folders")
             for subdir in SUBDIRS_REMOVE_AFTER_EVAL:
                 dir_path = work_dir / subdir
                 if dir_path.exists():
@@ -862,7 +801,7 @@ class VisionTaskExperiment:
         )
 
         trainer2 = YOLOTrainer(
-            model_weights=self.model_weights,
+            model_weights=str(weak_weights),
             data_yaml=str(mixed_yaml),
             output_dir=work_dir / "stage2"
         )

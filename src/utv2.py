@@ -1136,6 +1136,7 @@ class UnbiasedTeacherV2Trainer:
         self,
         labeled_loader: Iterable,
         unlabeled_loader: Iterable,
+        labeled_loader_val: Iterable,
         epochs: Optional[int] = None,
         patience: Optional[int] = 10,
     ):
@@ -1173,6 +1174,7 @@ class UnbiasedTeacherV2Trainer:
 
             epoch_stats = []
 
+            # Train
             for labeled in labeled_loader:
                 try:
                     unlabeled = next(unlabeled_iter)
@@ -1215,6 +1217,35 @@ class UnbiasedTeacherV2Trainer:
 
                 epoch_stats.append(stats)
 
+            # Val
+            self.student.eval()
+            self.teacher.eval()
+
+            running_val_loss = 0.0
+            for labeled in labeled_loader_val:
+                labeled_images, labeled_batch = labeled
+
+                labeled_images = labeled_images.to(
+                    self.device,
+                    non_blocking=True,
+                )
+
+                labeled_batch = {
+                    k: v.to(self.device)
+                    if torch.is_tensor(v)
+                    else v
+                    for k, v in labeled_batch.items()
+                }
+
+                with torch.no_grad():
+                    val_sup_loss, _ = self.supervised_loss(
+                        labeled_images,
+                        labeled_batch,
+                    )
+                    running_val_loss += val_sup_loss.detach().item()
+
+            running_val_loss /= max(len(labeled_loader_val), 1)
+
             mean_loss = torch.stack(
                 [
                     x["loss"].float().cpu()
@@ -1247,6 +1278,7 @@ class UnbiasedTeacherV2Trainer:
                 "sup_loss": mean_sup,
                 "unsup_loss": mean_unsup,
                 "num_pseudo": mean_pseudo,
+                "val_loss": running_val_loss,
             }
 
             history.append(row)
@@ -1256,11 +1288,13 @@ class UnbiasedTeacherV2Trainer:
                 f"loss={mean_loss:.5f} | "
                 f"sup={mean_sup:.5f} | "
                 f"unsup={mean_unsup:.5f} | "
-                f"pseudo={mean_pseudo:.1f}"
+                f"pseudo={mean_pseudo:.1f} | "
+                f"val={running_val_loss:.5f}"
             )
 
-            if mean_loss < best_loss:
-                best_loss = mean_loss
+            if running_val_loss < best_loss:
+                # Save best weights
+                best_loss = running_val_loss
                 self.save_weights(self.final_weights_path)
 
             with open(history_path, "w", encoding="utf-8") as f:
@@ -1271,7 +1305,7 @@ class UnbiasedTeacherV2Trainer:
             # Patience-based early stopping
             if patience is not None:
                 if len(history) > patience:
-                    recent_losses = [h["loss"] for h in history[-patience:]]
+                    recent_losses = [h["val_loss"] for h in history[-patience:]]
                     # No change in metric
                     EPS = 1e-4
                     mean = np.mean(recent_losses)
@@ -1286,7 +1320,7 @@ class UnbiasedTeacherV2Trainer:
         best_metrics = {}
         if len(history) > 0:
             # Best epoch by minimal total loss.
-            best_metrics = min(history, key=lambda r: r.get("loss", float("inf")))
+            best_metrics = min(history, key=lambda r: r.get("val_loss", float("inf")))
 
         with open(best_val_path, "w", encoding="utf-8") as f:
             json.dump(best_metrics, f, indent=2)
@@ -1319,6 +1353,8 @@ class UnbiasedTeacherV2Trainer:
         self,
         labeled_images_dir: str | Path,
         labeled_labels_dir: str | Path,
+        labeled_images_dir_val: str | Path,
+        labeled_labels_dir_val: str | Path,
         unlabeled_images_dir: str | Path,
         epochs: Optional[int] = None,
         batch_size: Optional[int] = None,
@@ -1448,12 +1484,21 @@ class UnbiasedTeacherV2Trainer:
             return imgs, {"batch_idx": batch_idx, "cls": cls, "bboxes": bboxes}
 
         labeled_ds = LabeledDataset(labeled_images_dir, labeled_labels_dir, transform, img_size)
+        labeled_ds_val = LabeledDataset(labeled_images_dir_val, labeled_labels_dir_val, transform, img_size)
         unlabeled_ds = UnlabeledTwoViewDataset(unlabeled_images_dir, shared_t, weak_t, strong_t)
 
         labeled_loader = torch.utils.data.DataLoader(
             labeled_ds,
             batch_size=batch_size,
             shuffle=True,
+            num_workers=num_workers,
+            collate_fn=collate_labeled,
+        )
+
+        labeled_loader_val = torch.utils.data.DataLoader(
+            labeled_ds_val,
+            batch_size=batch_size,
+            shuffle=False,  
             num_workers=num_workers,
             collate_fn=collate_labeled,
         )
@@ -1465,7 +1510,7 @@ class UnbiasedTeacherV2Trainer:
             num_workers=num_workers,
         )
 
-        return self.train(labeled_loader, unlabeled_loader, epochs=epochs, patience=patience)
+        return self.train(labeled_loader, unlabeled_loader, labeled_loader_val, epochs=epochs, patience=patience)
         
 
 

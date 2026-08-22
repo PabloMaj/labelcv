@@ -4,3 +4,5 @@ runs/
 data/
 *.pt
 *.pth
+*.csv
+*.png
