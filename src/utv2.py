@@ -18,7 +18,7 @@ import random
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional
 from pathlib import Path
 from PIL import Image
 import torchvision.transforms as T
@@ -26,6 +26,7 @@ import torchvision.transforms as T
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import batched_nms
 from ultralytics import YOLO
 from ultralytics.nn.modules.conv import Conv
 from ultralytics.nn.modules.head import Detect
@@ -50,8 +51,8 @@ class UTv2Config:
     ema_momentum: float = 0.9996
 
     pseudo_conf: float = 0.7
+    pseudo_nms_iou: float = 0.5
     uncertainty_margin: float = 0.0
-    student_uncertainty_threshold: Optional[float] = None
 
     supervised_weight: float = 1.0
     unsupervised_cls_weight: float = 1.0
@@ -59,6 +60,7 @@ class UTv2Config:
     uncertainty_weight: float = 1.0
 
     warmup_epochs: int = 1
+    unsup_ramp_epochs: int = 5
 
 
 # ============================================================================
@@ -425,7 +427,7 @@ class UTv2DetectionLoss(v8DetectionLoss):
 
         # Ensure scalar denominator (Python int) to avoid Tensor-vs-int
         # comparison errors and downstream type issues.
-        target_scores_sum = max(int(target_scores.sum().item()), 1)
+        target_scores_sum = int(target_scores.sum().clamp_min(1.0).item())
 
         loss[1] = (
             self.bce(
@@ -501,6 +503,150 @@ class UTv2DetectionLoss(v8DetectionLoss):
             nll * weight
         ).sum() / weight.sum().clamp_min(1.0)
 
+    def assign_targets(
+        self,
+        preds,
+        batch,
+    ):
+        pred_distri = preds["boxes"].permute(
+            0, 2, 1
+        ).contiguous()
+
+        pred_scores = preds["scores"].permute(
+            0, 2, 1
+        ).contiguous()
+
+        anchor_points, stride_tensor = make_anchors(
+            preds["feats"],
+            self.stride,
+            0.5,
+        )
+
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+
+        imgsz = (
+            torch.tensor(
+                preds["feats"][0].shape[2:],
+                device=self.device,
+                dtype=dtype,
+            )
+            * self.stride[0]
+        )
+
+        # ----------------------------------------------------------
+        # Pad teacher uncertainty exactly like YOLO preprocess()
+        # pads GT/pseudo targets.
+        #
+        # batch["uncertainty"]:
+        #     [total_pseudo, 4]
+        #
+        # padded_teacher_sigma:
+        #     [B, max_pseudo_per_image, 4]
+        # ----------------------------------------------------------
+
+        teacher_sigma_flat = batch["uncertainty"].to(
+            self.device
+        )
+
+        if batch["batch_idx"].numel() > 0:
+            counts = torch.bincount(
+                batch["batch_idx"],
+                minlength=batch_size,
+            )
+            max_gt = int(counts.max().item())
+        else:
+            max_gt = 0
+
+        padded_teacher_sigma = torch.full(
+            (batch_size, max_gt, 4),
+            float("inf"),
+            device=self.device,
+            dtype=teacher_sigma_flat.dtype,
+        )
+
+        if max_gt > 0:
+            gt_positions = torch.zeros(
+                batch_size,
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            for i in range(batch["batch_idx"].numel()):
+                b = int(batch["batch_idx"][i].item())
+                pos = gt_positions[b]
+
+                padded_teacher_sigma[
+                    b,
+                    pos,
+                ] = teacher_sigma_flat[i]
+
+                gt_positions[b] += 1
+
+        # ----------------------------------------------------------
+        # Normal YOLO target preprocessing
+        # ----------------------------------------------------------
+
+        targets = torch.cat(
+            (
+                batch["batch_idx"].view(-1, 1),
+                batch["cls"].view(-1, 1),
+                batch["bboxes"],
+            ),
+            dim=1,
+        )
+
+        targets = self.preprocess(
+            targets.to(self.device),
+            batch_size,
+            scale_tensor=imgsz[[1, 0, 1, 0]],
+        )
+
+        gt_labels, gt_bboxes = targets.split(
+            (1, 4),
+            2,
+        )
+
+        mask_gt = gt_bboxes.sum(
+            2,
+            keepdim=True,
+        ).gt_(0.0)
+
+        pred_bboxes = self.bbox_decode(
+            anchor_points,
+            pred_distri,
+        )
+
+        (
+            target_labels,
+            target_bboxes,
+            target_scores,
+            fg_mask,
+            target_gt_idx,
+        ) = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(
+                gt_bboxes.dtype
+            ),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        return {
+            "pred_distri": pred_distri,
+            "pred_scores": pred_scores,
+            "pred_bboxes": pred_bboxes,
+            "anchor_points": anchor_points,
+            "stride_tensor": stride_tensor,
+            "target_bboxes": target_bboxes,
+            "target_scores": target_scores,
+            "fg_mask": fg_mask,
+            "imgsz": imgsz,
+            "target_gt_idx": target_gt_idx,
+            "padded_teacher_sigma": padded_teacher_sigma,
+        }
 
 # ============================================================================
 # Listen2Student
@@ -511,28 +657,17 @@ def listen2student_mask(
     student_sigma: torch.Tensor,
     teacher_confident: torch.Tensor,
     margin: float = 0.0,
-    student_threshold: Optional[float] = None,
 ):
     """
-    Boundary-wise Listen2Student gate.
-
-    A teacher boundary is trusted only when the teacher is more certain than
-    the student for that particular L/T/R/B boundary.
+    Trust a teacher boundary when the teacher is more certain than
+    the student for that boundary.
     """
+    mask = (
+        teacher_sigma + margin
+        < student_sigma
+    )
 
-    # Teacher is trusted when its boundary uncertainty is strictly
-    # smaller than the student's uncertainty (optionally with a margin).
-    mask = (teacher_sigma + margin) < student_sigma
-
-    # Only consider locations where teacher produced a confident pseudo-label.
     mask &= teacher_confident.unsqueeze(-1)
-
-    # If a student uncertainty threshold is provided, require the
-    # student's uncertainty to be at most that threshold (i.e. less
-    # uncertain than the given limit). This makes the threshold act as
-    # a maximum-allowed student uncertainty for accepting teacher guidance.
-    if student_threshold is not None:
-        mask &= student_sigma <= student_threshold
 
     return mask
 
@@ -545,20 +680,66 @@ def listen2student_mask(
 def pseudo_labels(
     decoded: Dict[str, torch.Tensor],
     confidence: float,
+    iou_threshold: float = 0.5,
 ):
+    """
+    Convert dense teacher predictions into sparse pseudo detections.
+
+    Returns a list with one dictionary per batch image:
+        boxes       [K, 4]
+        classes     [K]
+        confidence  [K]
+        uncertainty [K, 4]
+        indices     [K]  original dense prediction indices
+    """
     scores = decoded["scores"]
+    boxes = decoded["boxes"]
+    uncertainty = decoded["uncertainty"]
 
-    conf, cls = scores.max(dim=-1)
+    batch_pseudo = []
 
-    mask = conf >= confidence
+    for b in range(boxes.shape[0]):
+        conf, cls = scores[b].max(dim=-1)
 
-    return {
-        "boxes": decoded["boxes"],
-        "classes": cls,
-        "confidence": conf,
-        "uncertainty": decoded["uncertainty"],
-        "mask": mask,
-    }
+        keep = conf >= confidence
+
+        if not keep.any():
+            batch_pseudo.append({
+                "boxes": boxes.new_zeros((0, 4)),
+                "classes": cls.new_zeros((0,), dtype=torch.long),
+                "confidence": conf.new_zeros((0,)),
+                "uncertainty": uncertainty.new_zeros((0, 4)),
+                "indices": cls.new_zeros((0,), dtype=torch.long),
+            })
+            continue
+
+        candidate_indices = torch.nonzero(
+            keep,
+            as_tuple=False,
+        ).squeeze(1)
+
+        candidate_boxes = boxes[b, candidate_indices]
+        candidate_conf = conf[candidate_indices]
+        candidate_cls = cls[candidate_indices]
+
+        keep_nms = batched_nms(
+            candidate_boxes,
+            candidate_conf,
+            candidate_cls,
+            iou_threshold,
+        )
+
+        final_indices = candidate_indices[keep_nms]
+
+        batch_pseudo.append({
+            "boxes": boxes[b, final_indices],
+            "classes": cls[final_indices],
+            "confidence": conf[final_indices],
+            "uncertainty": uncertainty[b, final_indices],
+            "indices": final_indices,
+        })
+
+    return batch_pseudo
 
 
 # ============================================================================
@@ -635,6 +816,8 @@ class UnbiasedTeacherV2Trainer:
             weight_decay=self.cfg.weight_decay,
         )
 
+        self.global_step = 0
+
     # ------------------------------------------------------------------
     # Supervised
     # ------------------------------------------------------------------
@@ -650,6 +833,88 @@ class UnbiasedTeacherV2Trainer:
     # ------------------------------------------------------------------
     # Unsupervised
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def xyxy_to_xywh(boxes):
+        x1, y1, x2, y2 = boxes.unbind(dim=-1)
+
+        return torch.stack(
+            (
+                (x1 + x2) / 2,
+                (y1 + y2) / 2,
+                x2 - x1,
+                y2 - y1,
+            ),
+            dim=-1,
+        )
+
+    def build_pseudo_batch(
+        self,
+        pseudo,
+        image_size,
+    ):
+        """
+        Convert sparse pseudo detections into the batch format expected
+        by the YOLO target assignment/loss path.
+        """
+        batch_idx = []
+        classes = []
+        boxes = []
+        uncertainty = []
+
+        for i, detections in enumerate(pseudo):
+            n = detections["boxes"].shape[0]
+
+            if n == 0:
+                continue
+
+            batch_idx.append(
+                torch.full(
+                    (n,),
+                    i,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            )
+
+            classes.append(detections["classes"])
+
+            h, w = image_size
+            pseudo_xywh = self.xyxy_to_xywh(detections["boxes"])
+            pseudo_xywh[:, [0, 2]] /= w
+            pseudo_xywh[:, [1, 3]] /= h
+            boxes.append(pseudo_xywh)
+
+            uncertainty.append(detections["uncertainty"])
+
+        if not batch_idx:
+            return {
+                "batch_idx": torch.zeros(
+                    (0,),
+                    device=self.device,
+                    dtype=torch.long,
+                ),
+                "cls": torch.zeros(
+                    (0,),
+                    device=self.device,
+                    dtype=torch.long,
+                ),
+                "bboxes": torch.zeros(
+                    (0, 4),
+                    device=self.device,
+                ),
+                "uncertainty": torch.zeros(
+                    (0, 4),
+                    device=self.device,
+                ),
+            }
+
+        return {
+            "batch_idx": torch.cat(batch_idx),
+            "cls": torch.cat(classes),
+            "bboxes": torch.cat(boxes),
+            "uncertainty": torch.cat(uncertainty),
+        }
 
     def unsupervised_loss(
         self,
@@ -670,6 +935,7 @@ class UnbiasedTeacherV2Trainer:
             pseudo = pseudo_labels(
                 teacher_decoded,
                 self.cfg.pseudo_conf,
+                self.cfg.pseudo_nms_iou,
             )
 
         # Student receives strong view.
@@ -680,87 +946,106 @@ class UnbiasedTeacherV2Trainer:
             student_preds,
         )
 
-        teacher_sigma = pseudo["uncertainty"]
-        student_sigma = student_decoded["uncertainty"]
-
-        confident = pseudo["mask"]
-
-        # --------------------------------------------------------------
-        # Listen2Student regression selection
-        # --------------------------------------------------------------
-
-        boundary_mask = listen2student_mask(
-            teacher_sigma,
-            student_sigma,
-            confident,
-            margin=self.cfg.uncertainty_margin,
-            student_threshold=self.cfg.student_uncertainty_threshold,
+        pseudo_batch = self.build_pseudo_batch(
+            pseudo,
+            image_size=strong_images.shape[-2:],
         )
 
-        # Use float mask for loss computations (weights / sums).
-        boundary_mask = boundary_mask.float()
+        # No confident pseudo detections in the whole batch.
+        if pseudo_batch["batch_idx"].numel() == 0:
+            zero = student_preds["scores"].sum() * 0.0
+
+            return zero, {
+                "loss_cls": zero.detach(),
+                "loss_box": zero.detach(),
+                "num_pseudo": torch.tensor(
+                    0,
+                    device=self.device,
+                ),
+                "num_reg_boundaries": torch.tensor(
+                    0,
+                    device=self.device,
+                ),
+            }
+
+        assigned = self.criterion.assign_targets(
+            student_preds,
+            pseudo_batch,
+        )
+
+        pred_scores = assigned["pred_scores"]
+        target_scores = assigned["target_scores"]
+        fg_mask = assigned["fg_mask"]
+        target_gt_idx = assigned["target_gt_idx"]
+        padded_teacher_sigma = assigned["padded_teacher_sigma"]
+
+        target_scores_sum = target_scores.sum().clamp_min(1.0)
+ 
 
         # --------------------------------------------------------------
-        # Classification pseudo-label loss
+        # Classification: normal YOLO-style classification against
+        # assigned pseudo targets.
         # --------------------------------------------------------------
-
-        student_logits = (
-            student_preds["scores"]
-            .permute(0, 2, 1)
-            .contiguous()
-        )
-
-        cls = pseudo["classes"]
-
-        target_cls = torch.zeros_like(student_logits)
-
-        target_cls.scatter_(
-            -1,
-            cls.unsqueeze(-1),
-            1.0,
-        )
-
-        cls_loss = F.binary_cross_entropy_with_logits(
-            student_logits,
-            target_cls,
-            reduction="none",
-        )
-
-        # Weight classification targets by pseudo-label confidence and
-        # only consider entries where the teacher was confident.
-        pseudo_conf = pseudo["confidence"]
-        cls_mask = confident.unsqueeze(-1).float()
-
-        weight = cls_mask * pseudo_conf.unsqueeze(-1)
 
         loss_cls = (
-            cls_loss * weight
-        ).sum() / weight.sum().clamp_min(1.0)
-
-        # --------------------------------------------------------------
-        # Boundary-wise regression
-        # --------------------------------------------------------------
-
-        anchors = student_decoded["anchors"]
-        stride = student_decoded["stride"]
-
-        teacher_boxes = pseudo["boxes"] / stride
-        student_boxes = student_decoded["boxes"] / stride
-
-        teacher_ltrb = xyxy_to_ltrb(
-            teacher_boxes,
-            anchors,
+            self.criterion.bce(
+                pred_scores,
+                target_scores.to(pred_scores.dtype),
+            ).sum()
+            / target_scores_sum
         )
 
-        student_ltrb = xyxy_to_ltrb(
-            student_boxes,
-            anchors,
-        )
+        # --------------------------------------------------------------
+        # Localization
+        # --------------------------------------------------------------
 
-        loss_box = (
-            (student_ltrb - teacher_ltrb.detach()).square()
-            * boundary_mask
-        ).sum() / boundary_mask.sum().clamp_min(1.0)
+        loss_box = pred_scores.sum() * 0.0
+        num_reg_boundaries = 0
+
+        if fg_mask.any():
+
+            pred_bboxes = assigned["pred_bboxes"]
+            target_bboxes = assigned["target_bboxes"]
+            anchor_points = assigned["anchor_points"]
+            stride_tensor = assigned["stride_tensor"]
+
+            # Standard assigned student/pseudo-target locations.
+            student_ltrb = xyxy_to_ltrb(
+                pred_bboxes,
+                anchor_points,
+            )
+
+            target_ltrb = xyxy_to_ltrb(
+                target_bboxes / stride_tensor,
+                anchor_points,
+            )
+
+            # ----------------------------------------------------------
+            # Listen2Student uncertainty gate
+            # ----------------------------------------------------------
+
+            # Student uncertainty at all assigned locations.
+            student_sigma = student_decoded["uncertainty"]
+
+            teacher_sigma = torch.gather(
+                padded_teacher_sigma,
+                dim=1,
+                index=target_gt_idx.unsqueeze(-1).expand(-1, -1, 4),
+            )
+
+            boundary_mask = listen2student_mask(
+                teacher_sigma,
+                student_sigma,
+                fg_mask,
+                margin=self.cfg.uncertainty_margin,
+            ).float()
+
+            loss_box = (
+                (student_ltrb - target_ltrb.detach()).square()
+                * boundary_mask
+            ).sum() / boundary_mask.sum().clamp_min(1.0)
+
+            num_reg_boundaries = boundary_mask.sum()
 
         total = (
             self.cfg.unsupervised_cls_weight * loss_cls
@@ -770,8 +1055,16 @@ class UnbiasedTeacherV2Trainer:
         return total, {
             "loss_cls": loss_cls.detach(),
             "loss_box": loss_box.detach(),
-            "num_pseudo": confident.sum().detach(),
-            "num_reg_boundaries": boundary_mask.sum().detach(),
+            "num_pseudo": torch.tensor(
+                sum(x["boxes"].shape[0] for x in pseudo),
+                device=self.device,
+            ),
+            "num_reg_boundaries": num_reg_boundaries.detach()
+            if torch.is_tensor(num_reg_boundaries)
+            else torch.tensor(
+                num_reg_boundaries,
+                device=self.device,
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -807,11 +1100,15 @@ class UnbiasedTeacherV2Trainer:
         total.backward()
         self.optimizer.step()
 
+        ema_momentum = self.get_ema_momentum()
+
         update_ema(
             self.teacher,
             self.student,
-            self.cfg.ema_momentum,
+            ema_momentum,
         )
+
+        self.global_step += 1
 
         return {
             "loss": total.detach(),
@@ -825,6 +1122,16 @@ class UnbiasedTeacherV2Trainer:
     # Training loop
     # ------------------------------------------------------------------
 
+    def get_ema_momentum(self):
+        """
+        Start with a faster teacher update and gradually approach
+        the configured EMA momentum.
+        """
+        return min(
+            1.0 - 1.0 / (self.global_step + 1),
+            self.cfg.ema_momentum,
+        )
+    
     def train(
         self,
         labeled_loader: Iterable,
@@ -853,7 +1160,16 @@ class UnbiasedTeacherV2Trainer:
             if epoch < self.cfg.warmup_epochs:
                 unsup_weight = 0.0
             else:
-                unsup_weight = 1.0
+                ramp_progress = (
+                    epoch - self.cfg.warmup_epochs + 1
+                ) / max(
+                    self.cfg.unsup_ramp_epochs,
+                    1,
+                )
+                unsup_weight = min(
+                    ramp_progress,
+                    1.0,
+                )
 
             epoch_stats = []
 
@@ -978,19 +1294,21 @@ class UnbiasedTeacherV2Trainer:
         return history
 
     def save_weights(self, path: str | Path):
-        """Save the student to `path` using Ultralytics checkpoint format.
+        """Save the student to `path` using a standard Ultralytics checkpoint format.
 
-        Args:
-            path: file path to write (e.g. '.../weights/best.pt').
+        The `model` payload must be a plain state_dict so the resulting file can be
+        loaded by `YOLO(path)`/`model.load_state_dict()`-style workflows.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         ckpt = {
-            "model": self.student.half() if hasattr(self.student, "half") else self.student,
+            "model": self.student.state_dict(),
+            "teacher": self.teacher.state_dict(),
             "train_args": vars(self.args) if hasattr(self, "args") else {},
+            "epoch": getattr(self, "global_step", 0),
         }
-        
+
         torch.save(ckpt, path)
 
     # ------------------------------------------------------------------
@@ -1006,6 +1324,7 @@ class UnbiasedTeacherV2Trainer:
         batch_size: Optional[int] = None,
         img_size: Optional[int] = None,
         num_workers: int = 0,
+        patience: Optional[int] = 50
     ):
         """
         Build simple dataloaders from image/label folders and run UTv2 training.
@@ -1019,10 +1338,26 @@ class UnbiasedTeacherV2Trainer:
         batch_size = int(batch_size or self.cfg.batch_size)
         img_size = int(img_size or self.cfg.img_size)
 
+        # Define transforms for labeled images (single view) and unlabeled images (weak + strong views).
+        # labeled
         transform = T.Compose([
             T.Resize((img_size, img_size)),
             T.ToTensor(),
         ])
+        # weak and strong transforms for unlabeled views
+        shared_t = T.Compose([
+            T.Resize((img_size, img_size)),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomAffine(translate=(0.1, 0.1)),
+        ])
+        weak_t = T.Compose([
+            T.ToTensor(),
+        ])
+        strong_t = T.Compose([
+            T.ColorJitter(0.4, 0., 0.7, 0.015),
+            T.ToTensor(),
+        ])
+        
 
         def parse_label_file(lbl_path: Path, img_w: int, img_h: int):
             boxes = []
@@ -1036,23 +1371,8 @@ class UnbiasedTeacherV2Trainer:
                     continue
                 cls = int(float(parts[0]))
                 cx, cy, w, h = map(float, parts[1:5])
-                # convert normalized cx,cy,w,h to absolute xyxy
-                x1 = (cx - w / 2.0) * img_w
-                y1 = (cy - h / 2.0) * img_h
-                x2 = (cx + w / 2.0) * img_w
-                y2 = (cy + h / 2.0) * img_h
-
-                # Scale boxes to the resized image size used by transforms
-                # (train_from_dirs resizes images to (img_size, img_size)).
-                if img_w > 0 and img_h > 0:
-                    scale_x = img_size / float(img_w)
-                    scale_y = img_size / float(img_h)
-                    x1 *= scale_x
-                    x2 *= scale_x
-                    y1 *= scale_y
-                    y2 *= scale_y
                 classes.append(cls)
-                boxes.append([x1, y1, x2, y2])
+                boxes.append([cx, cy, w, h])
 
             if len(boxes) == 0:
                 return [], []
@@ -1081,8 +1401,9 @@ class UnbiasedTeacherV2Trainer:
                 return img_t, classes, boxes
 
         class UnlabeledTwoViewDataset(torch.utils.data.Dataset):
-            def __init__(self, images_dir: Path, weak_transform, strong_transform):
+            def __init__(self, images_dir: Path, shared_transform, weak_transform, strong_transform):
                 self.images = sorted([p for p in images_dir.glob("*.*")])
+                self.transform = shared_transform
                 self.weak = weak_transform
                 self.strong = strong_transform
 
@@ -1092,6 +1413,7 @@ class UnbiasedTeacherV2Trainer:
             def __getitem__(self, idx):
                 img_path = self.images[idx]
                 img = Image.open(img_path).convert("RGB")
+                img = self.transform(img)
                 weak = self.weak(img)
                 strong = self.strong(img)
                 return weak, strong
@@ -1125,16 +1447,8 @@ class UnbiasedTeacherV2Trainer:
 
             return imgs, {"batch_idx": batch_idx, "cls": cls, "bboxes": bboxes}
 
-        # weak and strong transforms for unlabeled views
-        weak_t = T.Compose([T.Resize((img_size, img_size)), T.ToTensor()])
-        strong_t = T.Compose([
-            T.Resize((img_size, img_size)),
-            T.ColorJitter(0.4, 0.4, 0.4, 0.1),
-            T.ToTensor(),
-        ])
-
         labeled_ds = LabeledDataset(labeled_images_dir, labeled_labels_dir, transform, img_size)
-        unlabeled_ds = UnlabeledTwoViewDataset(unlabeled_images_dir, weak_t, strong_t)
+        unlabeled_ds = UnlabeledTwoViewDataset(unlabeled_images_dir, shared_t, weak_t, strong_t)
 
         labeled_loader = torch.utils.data.DataLoader(
             labeled_ds,
@@ -1151,7 +1465,7 @@ class UnbiasedTeacherV2Trainer:
             num_workers=num_workers,
         )
 
-        return self.train(labeled_loader, unlabeled_loader, epochs=epochs)
+        return self.train(labeled_loader, unlabeled_loader, epochs=epochs, patience=patience)
         
 
 
@@ -1163,10 +1477,4 @@ def save_student(
     trainer: UnbiasedTeacherV2Trainer,
     path: str,
 ):
-    torch.save(
-        {
-            "model": trainer.student.state_dict(),
-            "teacher": trainer.teacher.state_dict(),
-        },
-        path,
-    )
+    trainer.save_weights(path)
