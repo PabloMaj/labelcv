@@ -1417,7 +1417,7 @@ class UnbiasedTeacherV2Trainer:
 
         class LabeledDataset(torch.utils.data.Dataset):
             def __init__(self, images_dir: Path, labels_dir: Path, transform, img_size):
-                self.images = sorted([p for p in images_dir.glob("*.*")])
+                self.images = sorted([p for p in images_dir.glob("*.npy")])
                 self.labels_dir = labels_dir
                 self.transform = transform
                 self.img_size = img_size
@@ -1427,7 +1427,7 @@ class UnbiasedTeacherV2Trainer:
 
             def __getitem__(self, idx):
                 img_path = self.images[idx]
-                img = Image.open(img_path).convert("RGB")
+                img = np.load(img_path)
                 w, h = img.size
                 img_t = self.transform(img)
 
@@ -1438,7 +1438,7 @@ class UnbiasedTeacherV2Trainer:
 
         class UnlabeledTwoViewDataset(torch.utils.data.Dataset):
             def __init__(self, images_dir: Path, shared_transform, weak_transform, strong_transform):
-                self.images = sorted([p for p in images_dir.glob("*.*")])
+                self.images = sorted([p for p in images_dir.glob("*.npy")])
                 self.transform = shared_transform
                 self.weak = weak_transform
                 self.strong = strong_transform
@@ -1448,7 +1448,7 @@ class UnbiasedTeacherV2Trainer:
 
             def __getitem__(self, idx):
                 img_path = self.images[idx]
-                img = Image.open(img_path).convert("RGB")
+                img = np.load(img_path)
                 img = self.transform(img)
                 weak = self.weak(img)
                 strong = self.strong(img)

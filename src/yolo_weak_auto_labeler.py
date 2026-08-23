@@ -102,7 +102,7 @@ class YOLOWeakAutoLabeler:
             if self.task == "detect":
                 bboxes.append((x1, y1, x2, y2))
             elif self.task == "segment" and poly is not None:
-                segments.append((x1, y1, x2, y2, poly))
+                segments.append(poly)
 
         label_path = out_label_dir / f"{img_path.stem}.txt"
 
@@ -128,13 +128,9 @@ class YOLOWeakAutoLabeler:
 
     def _save_yolo_seg_labels(self, label_path: Path, segments: Iterable, img_w: int, img_h: int):
         lines = []
-        for x1, y1, x2, y2, poly in segments:
-            cx = ((x1 + x2) / 2) / img_w
-            cy = ((y1 + y2) / 2) / img_h
-            bw = (x2 - x1) / img_w
-            bh = (y2 - y1) / img_h
+        for poly in segments:
             poly_norm = [f"{px / img_w:.6f} {py / img_h:.6f}" for px, py in poly]
-            lines.append(f"{self.class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f} " + " ".join(poly_norm))
+            lines.append(f"{self.class_id} " + " ".join(poly_norm))
         with open(label_path, "w") as f:
             f.write("\n".join(lines))
 
