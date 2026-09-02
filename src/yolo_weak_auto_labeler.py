@@ -2,6 +2,7 @@ from pathlib import Path
 import cv2
 from typing import Optional, Iterable
 from tqdm import tqdm
+import numpy as np
 
 from src.yolo_bbox_visualizer import YoloBBoxVisualizer
 
@@ -11,6 +12,7 @@ from ultralytics import YOLO
 
 class WeakYoloSingleton:
     _instance = None
+    max_instances_per_image = 25
 
     def __new__(cls, model_path: str, conf_thresh: float = 0.25, iou_thresh: float = 0.7, device: str = "cuda"):
         if cls._instance is None:
@@ -33,6 +35,7 @@ class WeakYoloSingleton:
             iou=self.iou_thresh,
             device=self.device,
             verbose=False,
+            max_det=self.max_instances_per_image
         )
 
         detections = []
@@ -129,6 +132,8 @@ class YOLOWeakAutoLabeler:
     def _save_yolo_seg_labels(self, label_path: Path, segments: Iterable, img_w: int, img_h: int):
         lines = []
         for poly in segments:
+            if len(poly) < 3:
+                continue
             poly_norm = [f"{px / img_w:.6f} {py / img_h:.6f}" for px, py in poly]
             lines.append(f"{self.class_id} " + " ".join(poly_norm))
         with open(label_path, "w") as f:

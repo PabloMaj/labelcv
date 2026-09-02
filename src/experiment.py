@@ -128,7 +128,7 @@ class VisionTaskExperiment:
 
         model = YOLO(weights)
         with torch.no_grad():
-            results = model.val(data=str(data_yaml), save_json=True, plots=True, project=work_dir, name="stage1_conf_score_thresh")
+            results = model.val(data=str(data_yaml), workers=0, cache='ram', save_json=True, plots=True, project=work_dir, name="stage1_conf_score_thresh")
         f1_curve = results.box.f1_curve.flatten()
         best_idx = f1_curve.argmax()
         conf_thresholds = np.linspace(0, 1, len(f1_curve))
@@ -534,6 +534,7 @@ class VisionTaskExperiment:
             labeled_yaml = work_dir / "labeled.yaml"
             labeled_yaml.write_text(
                 f"""
+                path: {work_dir.as_posix()}
                 train: {train_path.as_posix()}
                 val: {val_path.as_posix()}
     
@@ -567,7 +568,8 @@ class VisionTaskExperiment:
     
             # ----------------------------------------------------
             # (4) Training with Unbiased Teacher (UT)
-            # ----------------------------------------------------
+            # ---------------------------------------------------- 
+
             self.logger.info("(4) Training with Unbiased Teacher (UT)")
 
             trainer2 = UnbiasedTeacherV2Trainer(
@@ -579,16 +581,13 @@ class VisionTaskExperiment:
             # Use folder-based adapter to build simple dataloaders from the
             # mixed image/label folders and unlabeled images.
             _ = trainer2.train_from_dirs(
-                labeled_images_dir=labeled_img_dir_train,
-                labeled_labels_dir=labeled_lbl_dir_train,
-                labeled_images_dir_val=labeled_img_dir_val,
-                labeled_labels_dir_val=labeled_lbl_dir_val,
+                labeled_yaml=str(labeled_yaml),             
                 unlabeled_images_dir=unlabeled_img_dir_train,
-                epochs=train_kwargs_normal.get("epochs", None),
-                batch_size=train_kwargs_normal.get("batch", None),
-                img_size=train_kwargs_normal.get("imgsz", None),
-                num_workers=train_kwargs_normal.get("workers", 0),
-                patience=train_kwargs_normal.get("patience", 50)
+                epochs=train_kwargs_weak.get("epochs", None),
+                batch_size=train_kwargs_weak.get("batch", None),
+                val_batch_size=test_kwargs.get("batch", None),
+                img_size=train_kwargs_weak.get("imgsz", None),
+                patience=train_kwargs_weak.get("patience", 50)
             )
             final_weights = trainer2.final_weights_path
     
